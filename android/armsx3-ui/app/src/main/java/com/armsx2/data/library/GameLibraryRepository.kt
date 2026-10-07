@@ -1,0 +1,1490 @@
+package com.armsx2.data.library
+
+import android.content.Context
+import android.net.Uri
+import android.os.Build
+import android.os.Environment
+import android.os.ParcelFileDescriptor
+import androidx.core.content.edit
+import androidx.core.net.toUri
+import androidx.documentfile.provider.DocumentFile
+import com.armsx2.FilenameParser
+import com.armsx2.GameInfo
+import com.armsx2.GamePlatform
+import com.armsx2.runtime.MainActivityRuntime
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import com.armsx2.CustomCovers
+import com.armsx2.DiscIcons
+import com.armsx2.Ps3Sfo
+import com.armsx3.NativeApp
+import net.rpcsx.GameFlag
+import net.rpcsx.RPCSX
+import net.rpcsx.GameRepository as NativeGames
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
+
+/**
+ * Bumped by every [GameLibraryRepository.invalidateCache].
+ *
+ * Invalidating only deletes the cache key, which the home screen reads on its FIRST load and
+ * never again, so the list already on screen went on showing the old library until a manual
+ * refresh: a game still shown as a package after its install, a trial still tagged after its
+ * unlock went in. HomeViewModel watches this and rescans instead.
+ */
+object LibraryInvalidations {
+    val count = MutableStateFlow(0)
+}
+
+class GameLibraryRepository(private val context: Context) {
+    private val gameExtensions = setOf(
+        "iso", "chd", "cso", "zso", "gz", "bin", "mdf", "img", "nrg", "dump", "elf",
+        // A multi-disc playlist, listed as a tile of its own (see addPlaylist).
+        "m3u",
+        // Not a game yet, which is the point of listing it. A package sitting in a games
+        // folder is a game the user has and cannot play, and nothing in the app said so.
+        "pkg",
+    )
+
+    /**
+     * Package categories that are not a game on their own.
+     *
+     * "GD" is a title update and "AC" is downloadable content: both refuse to install
+     * without the base game, and neither is something to show as a tile. The rest are
+     * themes, save data and the like. Stated as an exclusion rather than a whitelist so an
+     * unusual but genuine game package is still listed.
+     */
+    private val nonGameCategories = setOf("GD", "AC", "SD", "HM", "MS")
+
+    // Recent-games export runs off the launch/UI thread; exportLock serialises the file
+    // write so a quick play-then-remove can't interleave two writers on the same file.
+    private val exportScope = CoroutineScope(Dispatchers.IO)
+    private val exportLock = Any()
+
+    /**
+     * Cache identity: the folder set AND the scanner's schema version.
+     *
+     * The version matters because the cache stores the SCAN RESULT, not the
+     * inputs. When the scanner learns to read something new -- PS3 title IDs and
+     * disc icons out of PARAM.SFO, say -- every existing cache still says "these
+     * folders are done" and the new probe never runs. Bump this whenever the
+     * scanner starts extracting a field it did not before.
+     */
+    fun cacheKey(directories: List<String>): String =
+        "v$ScanSchemaVersion|" +
+            (directories.sorted() + internalGameDirectories().map { it.absolutePath })
+                .joinToString("|")
+
+    /**
+     * The emulator's OWN game storage, always scanned on top of the user's ROM folders.
+     *
+     * A PKG install and anything dropped into RPCS3's games directory land here, never in
+     * a ROM folder, so neither was reachable: this library replaced net.rpcsx's
+     * GameRepository, which did read both of these, and the paths came with it. Reported as
+     * "doesn't detect disc games from config folder like other ps3 emus".
+     *
+     * Both hold games in folder form, so [isPs3GameFolder] is what actually finds them.
+     */
+    /**
+     * Keep game art out of the user's gallery.
+     *
+     * An .iso is one opaque file, so the media scanner sees nothing inside it. A disc in
+     * FOLDER form lays its ICON0.PNG, PIC1.PNG and every DLC image out on shared storage,
+     * where the scanner indexes them and they land in the camera roll. One Minecraft folder
+     * accounted for 245 images, which was every image in the whole ROM tree.
+     *
+     * The marker goes at the ROM directory root the user configured, not inside a game
+     * folder: it covers current and future folder games in one file, and it never puts a
+     * stray file inside content the emulator mounts as a disc.
+     *
+     * Zero bytes and reversible, deleting it restores the old behaviour. Best effort, since
+     * the ROM folder may be read-only or reached over SAF.
+     */
+    private fun shieldFromMediaScanner(directory: File) {
+        runCatching {
+            val marker = File(directory, ".nomedia")
+            if (marker.exists()) return
+
+            if (marker.createNewFile()) {
+                android.util.Log.i(ScanTag, "wrote .nomedia in ${directory.absolutePath}")
+                // Adding the marker does not retroactively drop what MediaStore already
+                // indexed. Re-scanning the path is what makes the provider re-evaluate the
+                // subtree and forget it.
+                runCatching {
+                    android.media.MediaScannerConnection.scanFile(
+                        context, arrayOf(directory.absolutePath), null, null,
+                    )
+                }
+            }
+        }
+    }
+
+    /** True when the emulator's own storage holds games, ROM folders or not. */
+    fun hasInternalGames(): Boolean = internalGameDirectories().any {
+        runCatching { it.listFiles()?.isNotEmpty() }.getOrNull() == true
+    }
+
+    /**
+     * Absolute paths of installed titles the core cannot decrypt without a licence.
+     *
+     * Asked of the CORE rather than worked out here. The flag comes from actually attempting
+     * decrypt_self on the game's EBOOT (fetchGameInfo, rpcsx-android.cpp), which is the only
+     * honest answer to "does this need a .rap". Checking PARAM.SFO's CONTENT_ID against
+     * exdata instead -- the obvious pure-Kotlin shortcut -- would call every PSN title locked,
+     * including the many whose EBOOT needs no licence at all.
+     *
+     * Canonical paths on both sides: the core resolves the paths it reports, and
+     * /storage/emulated/0 and /data/media/0 are one directory under two names.
+     *
+     * Only the emulator's own storage is asked about, which is where PKG installs land.
+     *
+     * The same pass reports trials (GameFlag.Trial), which the core also has to open the
+     * EBOOT to tell apart, so both come out of one scan rather than decrypting everything
+     * twice.
+     */
+    private class CoreFlags(val locked: Set<String>, val trial: Set<String>)
+
+    private fun coreGameFlags(): CoreFlags = runCatching {
+        if (!RPCSX.initialized) return CoreFlags(emptySet(), emptySet())
+        // The native repository is a scratch buffer here: nothing else in this app reads it,
+        // and collectGameInfo appends into it.
+        NativeGames.clear()
+        internalGameDirectories().forEach { dir ->
+            RPCSX.instance.collectGameInfo(dir.absolutePath, -1)
+        }
+        val games = NativeGames.list()
+        fun pathsWith(flag: GameFlag) = games
+            .filter { it.hasFlag(flag) }
+            .mapNotNull { game -> runCatching { File(game.info.path).canonicalPath }.getOrNull() }
+            .toSet()
+        CoreFlags(pathsWith(GameFlag.Locked), pathsWith(GameFlag.Trial))
+    }.getOrDefault(CoreFlags(emptySet(), emptySet()))
+
+    private fun internalGameDirectories(): List<File> = listOf(
+        File(RPCSX.rootDirectory, "config/dev_hdd0/game"),
+        File(RPCSX.rootDirectory, "config/games"),
+    ).filter { runCatching { it.isDirectory }.getOrDefault(false) }
+
+    /**
+     * Drop the cached scan so the next library load re-reads storage.
+     *
+     * Needed after an install: it adds a game inside a directory that was already in the
+     * cache key, so nothing about the key changes and the library would keep serving the
+     * pre-install list.
+     */
+    fun invalidateCache() {
+        MainActivityRuntime.prefs.edit {
+            remove("gamesCacheKey")
+            remove("gamesCacheDir")
+        }
+        LibraryInvalidations.count.update { it + 1 }
+    }
+
+    fun loadCached(): CachedLibrary {
+        val cachedKey = MainActivityRuntime.prefs.getString("gamesCacheKey", null)
+            ?: MainActivityRuntime.prefs.getString("gamesCacheDir", null)
+        val json = MainActivityRuntime.prefs.getString("gamesCache", null)
+            ?: return CachedLibrary(cachedKey, emptyList())
+        val games = runCatching {
+            val array = JSONArray(json)
+            buildList {
+                repeat(array.length()) { index ->
+                    val item = array.getJSONObject(index)
+                    add(
+                        GameInfo(
+                            uri = item.getString("uri").toUri(),
+                            title = item.getString("title"),
+                            serial = if (item.isNull("serial")) null else item.optString("serial").takeIf(String::isNotBlank),
+                            compatibility = item.optInt("compat", 0),
+                            extension = item.optString("ext").ifBlank {
+                                item.getString("uri").substringAfterLast('.', "").uppercase()
+                            },
+                            platform = GamePlatform.fromKey(item.optString("platform").takeIf(String::isNotBlank)),
+                            // Absent in a cache written before #338 — optString gives "",
+                            // which reads as "no separate sort key / not translated", so an
+                            // old cache degrades to the previous behaviour until a rescan.
+                            titleSort = item.optString("titleSort"),
+                            titleEn = item.optString("titleEn"),
+                            locked = item.optBoolean("locked", false),
+                            trial = item.optBoolean("trial", false),
+                            contentId = item.optString("contentId"),
+                            drmFree = item.optBoolean("drmFree", false),
+                        ),
+                    )
+                }
+            }
+        }.getOrDefault(emptyList())
+        return CachedLibrary(cachedKey, games)
+    }
+
+    suspend fun scan(directories: List<String>): List<GameInfo> = withContext(Dispatchers.IO) {
+        // Seed the probe cache from the last scan before touching anything.
+        //
+        // probeDisc mounts the image into the emulator's GLOBAL vfs to read its PARAM.SFO,
+        // and discInfoCache only ever lived in memory on one repository instance, so every
+        // rescan re-mounted every disc from scratch. That is slow on a 7 GB image and it is
+        // the window in which a scan can collide with a boot or a teardown, which crashed
+        // the process inside vfs::mount.
+        //
+        // Everything the probe produces is already durable: the serial and title are in the
+        // library cache, and the icon is on disk under disc-icons. So a disc we have seen
+        // before never needs mounting again.
+        //
+        // That last clause is only true if the extraction actually succeeded once. The serial
+        // and title are durable by construction -- this loop is reading them -- but the icon
+        // is a separate file that may never have been written: probeDiscInfo answers "{}"
+        // whenever a game is loaded, and the serial then comes from the FILENAME instead,
+        // which for dev_hdd0/game/<title id> is indistinguishable from one the SFO gave us.
+        // Seeding on the serial alone made that miss permanent, because every later rescan
+        // skipped the one thing that would repair it. Reported as a PKG-installed title
+        // showing a text placeholder for good, with its ICON0.PNG sitting unread in the game
+        // folder and its path already recorded in games.json.
+        //
+        // So gate the skip on the icon as well, for the games that have one. Re-probing costs
+        // one mount, once, and only for a game actually missing it; a game whose icon is on
+        // disk still never mounts again, which is what the reasoning above is protecting.
+        val cached = loadCached()
+        val cachedGames = cached.games
+
+        // Disc images an older scanner cached are probed once more. v9 lists every game on a
+        // multi-game disc, and the probe that finds them runs only on a cache miss, which an
+        // image already in the library never has again. Worth one mount per image, once, and
+        // only while nothing is loaded; the version bump makes this the cold-start scan. A
+        // probe that fails anyway keeps the identity the cache had (see reprobeFallback).
+        //
+        // Its own preference rather than the cache key's version, because invalidateCache()
+        // deletes the key after every licence or package install, and reading that as "old
+        // scanner" would mount every image in the library each time.
+        val probedSchema = MainActivityRuntime.prefs.getInt(ProbedSchemaKey, 0)
+        val reprobeImages = probedSchema < DiscGamesSchemaVersion &&
+            MainActivityRuntime.eState.value == com.armsx2.EmuState.STOPPED
+        reprobeFallback.clear()
+
+        // A serial is an identity: two different games cannot hold the same one. When two cached
+        // entries do, at least one of them is wrong.
+        //
+        // That is what a failed disc probe used to produce. ISO.cpp copied out of its shared
+        // sector buffer before checking the read had succeeded, so a disc that failed to probe was
+        // handed the PREVIOUS disc's PARAM.SFO and recorded under its serial -- the good disc
+        // listed twice, the failing one absent, and both launching the good one. The read is
+        // checked now, but the wrong identity already written to the cache would outlive the fix,
+        // because an ISO is otherwise never re-probed: seeding it here makes every later scan skip
+        // the probe that would correct it. Renaming the file was the only way out, and only by
+        // accident, since a new path misses the seed.
+        //
+        // So drop the whole colliding group from the seed and let the scan settle it. Deliberately
+        // narrow -- a collision is rare, and this is the one case worth paying a re-probe for.
+        // A playlist is left out: it carries its first disc's serial on purpose, beside that disc's
+        // own tile, and counting it would re-probe that disc on every start.
+        val duplicated = cachedGames
+            .filterNot { it.extension.equals("m3u", ignoreCase = true) }
+            .mapNotNull { it.serial?.takeIf { s -> s.isNotBlank() } }
+            .groupingBy { it }
+            .eachCount()
+            .filterValues { it > 1 }
+            .keys
+
+        // One attempt per process, and only with the core idle -- see collisionRepairSpent.
+        val mayRepair = duplicated.isNotEmpty() &&
+            !collisionRepairSpent &&
+            MainActivityRuntime.eState.value == com.armsx2.EmuState.STOPPED
+
+        val collidingSerials = if (mayRepair) duplicated else emptySet()
+
+        if (duplicated.isNotEmpty()) {
+            collisionRepairSpent = true
+            android.util.Log.w(
+                ScanTag,
+                if (mayRepair) {
+                    "re-probing: ${duplicated.size} serial(s) claimed by more than one game: $duplicated"
+                } else {
+                    "${duplicated.size} serial(s) claimed by more than one game: $duplicated -- " +
+                        "not re-probing (already attempted this session, or a core is loaded); " +
+                        "restart the app to repair"
+                },
+            )
+        }
+
+        cachedGames.forEach { game ->
+            val serial = game.serial?.takeIf { it.isNotBlank() } ?: return@forEach
+            if (serial in collidingSerials) return@forEach
+            // A playlist is never probed itself, only its first disc, and that disc has its own
+            // tile to seed from. Seeding the playlist too, filed under the first disc's path,
+            // renamed that disc's tile to the playlist's name whenever it won the putIfAbsent.
+            if (game.extension.equals("m3u", ignoreCase = true)) return@forEach
+            // The same key probeDisc stores under, which for a game in a picked folder is its
+            // device path and not the document URI's. A mismatch here would not look like a
+            // cache miss: it would re-probe every scan, and re-probing an ISO is the mount
+            // that has taken the app down.
+            val path = discCacheKey(game) ?: return@forEach
+            // Folders only, and that is not a convenience: re-probing an ISO means load_iso ->
+            // vfs::mount, which is the process-wide mount this whole seeding exists to avoid, and
+            // it has crashed the app for real -- twice in one day, faulting in
+            // manual_typemap::init<vfs_manager> from this very thread while a boot was starting.
+            // A directory is read straight off disk by read_sfo_game_info with no mount at all,
+            // so it carries none of that risk. The game this was reported for was a PKG install
+            // (folder form) whose ICON0.PNG was sitting there unread, which is exactly the case
+            // that stays covered.
+            val isFolder = game.extension.equals("folder", ignoreCase = true)
+            if (isFolder && !DiscIcons.has(serial)) {
+                android.util.Log.i(ScanTag, "re-probing folder '$serial': no usable disc icon on disk")
+                return@forEach
+            }
+            if (reprobeImages && game.extension.lowercase() in probeExtensions) {
+                android.util.Log.i(ScanTag, "re-probing image '$serial' for other games on the disc")
+                reprobeFallback[path] = DiscInfo(serial, game.title)
+                return@forEach
+            }
+            discInfoCache.putIfAbsent(path, DiscInfo(serial, game.title))
+        }
+
+        val collected = linkedMapOf<String, GameInfo>()
+        userPlaylistDiscs.clear()
+        listedDirectories.clear()
+        android.util.Log.i(ScanTag, "scan start: ${directories.size} dir(s), rawStorage=${canUseRawStorage()}")
+        directories.forEach { rawUri ->
+            val uri = runCatching { rawUri.toUri() }.getOrNull() ?: return@forEach
+            val posix = MainActivityRuntime.resolveTreeUriToPosix(rawUri)
+            val rawRoot = if (canUseRawStorage()) posix?.let(::File) else null
+            android.util.Log.i(ScanTag, "dir=$rawUri -> posix=$posix isDir=${rawRoot?.isDirectory}")
+            if (rawRoot?.isDirectory == true) {
+                shieldFromMediaScanner(rawRoot)
+                scanRawDirectory(rawRoot, collected, 0)
+            } else {
+                // SAF fallback. Games found this way are LISTED but the core cannot boot them:
+                // it opens games with ordinary file IO and a document tree has no path to open.
+                // Without All files access every folder outside the emulator's own directory
+                // lands here, which reads as "the game is there but hangs on its loading
+                // screen" rather than as a permissions problem. Say which it is.
+                val tree = DocumentFile.fromTreeUri(context, uri)
+                if (!canUseRawStorage()) {
+                    android.util.Log.w(
+                        ScanTag,
+                        "  $rawUri is being scanned over SAF because All files access is not " +
+                            "granted. Games found here will appear in the library but cannot be " +
+                            "read by the emulator -- grant the permission, or move them into " +
+                            "the games directory inside the emulator folder."
+                    )
+                } else {
+                    android.util.Log.w(
+                        ScanTag,
+                        "  $rawUri has no filesystem path (posix=$posix); falling back to SAF. " +
+                            "Games found here cannot be read by the emulator."
+                    )
+                }
+                android.util.Log.i(ScanTag, "  SAF fallback: tree=${tree?.uri} canRead=${tree?.canRead()} children=${runCatching { tree?.listFiles()?.size }.getOrNull()}")
+                tree?.let { scanDocumentTree(it, collected, 0) }
+            }
+        }
+        internalGameDirectories().forEach { dir ->
+            android.util.Log.i(ScanTag, "internal dir=${dir.absolutePath}")
+            // dev_hdd0/game is the emulator's own install root and its shape is known: one
+            // directory per title, nothing else. It gets the strict scan. Everything else is
+            // a folder a user pointed us at, where games legitimately sit at any depth.
+            if (dir.name == "game") scanInstalledTitles(dir, collected)
+            else scanRawDirectory(dir, collected, 0)
+        }
+        addAutoPlaylists(collected)
+        val flags = coreGameFlags()
+        android.util.Log.i(
+            ScanTag,
+            "scan done: ${collected.size} game(s), ${flags.locked.size} locked, ${flags.trial.size} trial",
+        )
+        collected.values
+            .map { game ->
+                val path = runCatching { game.uri.path?.let { File(it).canonicalPath } }.getOrNull()
+                when {
+                    path == null -> game
+                    path in flags.locked || path in flags.trial -> game.copy(
+                        locked = game.locked || path in flags.locked,
+                        trial = game.trial || path in flags.trial,
+                    )
+                    else -> game
+                }
+            }
+            .sortedBy { it.title.lowercase() }
+            .also {
+                saveCache(directories, it)
+                // Only once the re-probe has actually run. Skipped because a game was loaded, it
+                // is still owed, and the next scan tries again.
+                if (reprobeImages) MainActivityRuntime.prefs.edit { putInt(ProbedSchemaKey, ScanSchemaVersion) }
+            }
+    }
+
+    fun recentGames(allGames: List<GameInfo>): List<GameInfo> {
+        val raw = MainActivityRuntime.prefs.getString("recentGameUris", null) ?: return emptyList()
+        val order = runCatching {
+            val array = JSONArray(raw)
+            List(array.length()) { array.getString(it) }
+        }.getOrDefault(emptyList())
+        val byUri = allGames.associateBy { it.uri.toString() }
+        return order.mapNotNull(byUri::get)
+    }
+
+    fun markPlayed(game: GameInfo) {
+        val uri = game.uri.toString()
+        val current = runCatching {
+            MainActivityRuntime.prefs.getString("recentGameUris", null)?.let(::JSONArray)?.let { array ->
+                MutableList(array.length()) { array.getString(it) }
+            }
+        }.getOrNull() ?: mutableListOf()
+        current.remove(uri)
+        current.add(0, uri)
+        while (current.size > 12) current.removeAt(current.lastIndex)
+        MainActivityRuntime.prefs.edit {
+            putString(
+                "recentGameUris",
+                JSONArray(current).toString()
+            )
+        }
+        val snapshot = current.toList()
+        exportScope.launch { exportRecentGamesPublic(snapshot, game) }
+    }
+
+    /**
+     * Drop a single game from Recently Played without touching the library or the
+     * global "Show Recently Played" toggle. It naturally returns to the top of the
+     * list the next time it's launched (markPlayed re-adds it).
+     */
+    fun removeFromRecent(game: GameInfo) {
+        val uri = game.uri.toString()
+        val current = runCatching {
+            MainActivityRuntime.prefs.getString("recentGameUris", null)?.let(::JSONArray)?.let { array ->
+                MutableList(array.length()) { array.getString(it) }
+            }
+        }.getOrNull() ?: return
+        if (!current.remove(uri)) return
+        MainActivityRuntime.prefs.edit {
+            putString(
+                "recentGameUris",
+                JSONArray(current).toString()
+            )
+        }
+        val snapshot = current.toList()
+        exportScope.launch { exportRecentGamesPublic(snapshot) }
+    }
+
+    /**
+     * Empty Recently Played. Same contract as [removeFromRecent], just for every entry: the
+     * library and the "Show Recently Played" toggle are untouched, and games reappear as they
+     * are launched again. The public export is refreshed so the shelf doesn't come back from
+     * the exported copy.
+     */
+    fun clearRecent() {
+        MainActivityRuntime.prefs.edit { remove("recentGameUris") }
+        exportScope.launch { exportRecentGamesPublic(emptyList()) }
+    }
+
+    /**
+     * Mirrors the recently-played list to a plain `recent_games.json` under the app's data
+     * root (the shared-storage folder the user picked, next to gamesettings/ and memcards/;
+     * or the app-private externalFilesDir when none was chosen). `recentGameUris` lives in
+     * app-private SharedPreferences no other app can read, so this hands companion tools
+     * (launchers, offline RA caches) the same "recently played" data they already read from
+     * that folder. Runs on exportScope (IO) so the cache parse + write never touch the
+     * launch/UI thread; exportLock serialises the write. Feature contributed by misantronic
+     * (PR #391), reworked here to run off-thread and to also fire on removal.
+     */
+    private fun exportRecentGamesPublic(orderedUris: List<String>, justPlayed: GameInfo? = null) {
+        val root = MainActivityRuntime.systemDirPosix()
+            ?: context.getExternalFilesDir(null)?.absolutePath
+            ?: return
+        val cached = loadCached().games
+        val byUri = (if (justPlayed != null) cached + justPlayed else cached).associateBy { it.uri.toString() }
+        val array = JSONArray()
+        orderedUris.forEach { uriString ->
+            val g = byUri[uriString] ?: return@forEach
+            array.put(JSONObject().apply {
+                put("uri", g.uri.toString())
+                put("title", g.title)
+                put("serial", g.serial ?: JSONObject.NULL)
+                put("ext", g.extension)
+                put("platform", g.platform.key)
+            })
+        }
+        synchronized(exportLock) {
+            runCatching { File(root, "recent_games.json").writeText(array.toString()) }
+        }
+    }
+
+    private fun scanDocumentTree(
+        directory: DocumentFile,
+        output: MutableMap<String, GameInfo>,
+        depth: Int,
+    ) {
+        if (depth > MaxScanDepth) return
+        listedDirectories += directory.uri.toString() to runCatching { directory.lastModified() }.getOrDefault(0L)
+        val children = runCatching { directory.listFiles() }.getOrNull() ?: return
+        // Asked only once a child is named like one of a data folder's own folders: listing the
+        // tree again for every directory would double the cost of scanning a large SAF folder.
+        val dataFolder by lazy { isDataFolderDocument(directory) }
+        children.forEach { file ->
+            if (file.isDirectory) {
+                val folderName = file.name
+                if (folderName != null && folderName in dataFolderInternals && dataFolder) return@forEach
+                // Same leaf rule as the raw scan, and now the same SFO probe too. This used
+                // to pass null and take the title from the folder name, because the core
+                // opens by path and a document tree had none to give. It has one now, so a
+                // game in a picked folder gets its real title, its serial and its ICON0.PNG
+                // like any other. Without the serial there is also no cover, no per-game
+                // config and no compatibility entry, so this was most of what "the games are
+                // there but wrong" meant on a build with no filesystem access.
+                if (runCatching { isPs3GameDocument(file) }.getOrDefault(false)) {
+                    val name = file.name ?: ""
+                    output.putIfAbsent(
+                        file.uri.toString(),
+                        createGame(file.uri, name, "folder", null, probeDevicePath(file.uri, name)),
+                    )
+                    addDiscGameDocuments(file, output)
+                    return@forEach
+                }
+                scanDocumentTree(file, output, depth + 1)
+                return@forEach
+            }
+            val name = file.name ?: return@forEach
+            val extension = name.substringAfterLast('.', "").lowercase()
+            if (extension !in gameExtensions) return@forEach
+            // As in the raw scan: a compiled module, never a disc image.
+            if (name.endsWith(".obj.gz", ignoreCase = true)) return@forEach
+            if (extension == "m3u") {
+                val path = com.armsx2.storage.ContentUri.devicePathForDocument(file.uri) ?: return@forEach
+                val text = runCatching {
+                    context.contentResolver.openInputStream(file.uri)?.use { it.readBytes().decodeToString() }
+                }.getOrNull() ?: return@forEach
+                addPlaylist(file.uri, path, name, text, output)
+                return@forEach
+            }
+            if (extension == "pkg") {
+                val pkg = probePkg {
+                    context.contentResolver.openFileDescriptor(file.uri, "r")
+                } ?: return@forEach
+                output.putIfAbsent(file.uri.toString(), createPackage(file.uri, name, pkg))
+                return@forEach
+            }
+
+            val disc = if (extension in probeExtensions) probeDevicePath(file.uri, name) else null
+            // probeDocument reads a PS2 SYSTEM.CNF, so it only ever answers for the handful of
+            // shapes the disc probe cannot read. Asking it first would spend an open on every
+            // PS3 game to be told nothing.
+            val probe = if (disc == null && extension in probeExtensions) {
+                probeDocument(file.uri)
+            } else {
+                null
+            }
+            output.putIfAbsent(file.uri.toString(), createGame(file.uri, name, extension, probe, disc))
+            if (disc != null) {
+                com.armsx2.storage.ContentUri.devicePathForDocument(file.uri)?.let { path ->
+                    addDiscGameImages(file.uri, path, name, extension, output)
+                }
+            }
+        }
+    }
+
+    /**
+     * True when this directory IS a game rather than a folder containing games.
+     *
+     * Two shapes, both common and neither an .iso:
+     *   - a JB folder dump, which keeps the disc layout: <dir>/PS3_GAME/PARAM.SFO
+     *     (PS3_DISC.SFB alongside it on a real disc rip)
+     *   - an installed/HDD game folder -- PARAM.SFO next to USRDIR. This is what
+     *     RPCS3's own games directory holds, and the shape prototypes that never
+     *     got a retail master ship in.
+     *
+     * Case-insensitive: these come off FAT/exFAT cards and out of archives, so
+     * "PS3_GAME" is as likely to be "ps3_game".
+     */
+    private fun isPs3GameFolder(directory: File): Boolean {
+        fun child(vararg path: String): File? {
+            var current: File = directory
+            for (segment in path) {
+                current = current.listFiles()
+                    ?.firstOrNull { it.name.equals(segment, ignoreCase = true) }
+                    ?: return null
+            }
+            return current
+        }
+        if (child("PS3_GAME", "PARAM.SFO")?.isFile == true) return true
+        if (child("PS3_DISC.SFB")?.isFile == true) return true
+        val sfo = child("PARAM.SFO")?.takeIf { it.isFile } ?: return false
+        if (child("USRDIR")?.isDirectory != true) return false
+        // A game data install has this exact shape too, a PARAM.SFO next to USRDIR, so the
+        // layout alone cannot tell it apart from an HDD game. It holds no EBOOT, so listing it
+        // gave every title that installs data a second tile that cannot boot (Skate 3's 1.1 GB
+        // BLUS30464_INSTALL, sitting next to the disc it belongs to). CATEGORY is what
+        // separates them: GD is data, HG and DG are games. The native scanner already rejects
+        // these because fetchGameInfo requires BOOTABLE and game data does not set it. This
+        // applies the same rule to the folder path, which never opens the SFO at all.
+        return sfoCategory(sfo) != "GD"
+    }
+
+    /**
+     * CATEGORY out of a PARAM.SFO, or null when it cannot be read.
+     *
+     * A malformed or truncated file has to degrade to "list it" rather than hide a real game,
+     * which is what [ParamSfo] answering null for every failure buys here.
+     */
+    private fun sfoCategory(sfo: File): String? = ParamSfo.string(sfo, "CATEGORY")
+
+    /** [isPs3GameFolder] over a SAF tree. */
+    private fun isPs3GameDocument(directory: DocumentFile): Boolean {
+        val children = runCatching { directory.listFiles() }.getOrNull() ?: return false
+        fun find(name: String) = children.firstOrNull { it.name.equals(name, ignoreCase = true) }
+        if (find("PS3_DISC.SFB")?.isFile == true) return true
+        find("PS3_GAME")?.takeIf { it.isDirectory }?.let { gameDir ->
+            val inner = runCatching { gameDir.listFiles() }.getOrNull().orEmpty()
+            if (inner.any { it.isFile && it.name.equals("PARAM.SFO", ignoreCase = true) }) return true
+        }
+        return find("PARAM.SFO")?.isFile == true && find("USRDIR")?.isDirectory == true
+    }
+
+    /**
+     * dev_hdd0/game, scanned as what it is: one directory per installed title.
+     *
+     * The recursive scan cannot be used here. It descends into anything that is not itself a
+     * game folder and then accepts any file whose extension is in [gameExtensions], and "img"
+     * is one of those. A title's own data is full of them, so once a package unpacked its
+     * contents over this directory rather than into a title folder of its own, GTA IV's
+     * archives arrived in the library as games: manhat01, props_ab, vehicles, script,
+     * weapons. Every one of them a .img sitting where the scanner was willing to look.
+     *
+     * The extractor no longer unpacks into this directory (see unpkg.cpp set_install_path),
+     * but nothing should be relying on that to keep the library clean, and existing installs
+     * still have the debris. A direct child here is a title or it is not listed.
+     */
+    private fun scanInstalledTitles(directory: File, output: MutableMap<String, GameInfo>) {
+        listedDirectories += directory.absolutePath to directory.lastModified()
+        val children = runCatching { directory.listFiles() }.getOrNull() ?: return
+        children.forEach { file ->
+            if (!file.isDirectory) return@forEach
+            if (!runCatching { isPs3GameFolder(file) }.getOrDefault(false)) {
+                android.util.Log.i(ScanTag, "  skipping non-title '${file.name}' in dev_hdd0/game")
+                return@forEach
+            }
+            val uri = Uri.fromFile(file)
+            android.util.Log.i(ScanTag, "  installed title '${file.name}'")
+            output.putIfAbsent(
+                uri.toString(),
+                createGame(uri, file.name, "folder", null, probeDisc(file)),
+            )
+        }
+    }
+
+    /**
+     * The folders of an emulator data folder that hold the emulator's own files: config/ (the
+     * installed firmware, dev_hdd0, memory dumps) and cache/ (compiled PPU and SPU modules).
+     * Their .bin and .obj.gz files pass the extension check, so a data folder inside a games
+     * folder listed a hundred of them as games: CEHtmlApi, ps1_rom, v9-kusa-...obj. Only these
+     * two are skipped. Someone who picked one folder for both keeps their games in it, and
+     * those still have to list.
+     */
+    private val dataFolderInternals = setOf("config", "cache")
+
+    /** True for an ARMSX3 (or RPCS3) data folder, which has the installed firmware in config/dev_flash. */
+    private fun isDataFolder(directory: File): Boolean =
+        runCatching { File(directory, "config/dev_flash").isDirectory }.getOrDefault(false)
+
+    /** [isDataFolder] over a SAF tree. */
+    private fun isDataFolderDocument(directory: DocumentFile): Boolean = runCatching {
+        directory.findFile("config")?.takeIf { it.isDirectory }?.findFile("dev_flash")?.isDirectory == true
+    }.getOrDefault(false)
+
+    private fun scanRawDirectory(
+        directory: File,
+        output: MutableMap<String, GameInfo>,
+        depth: Int,
+    ) {
+        if (depth > MaxScanDepth) return
+        listedDirectories += directory.absolutePath to directory.lastModified()
+        val children = runCatching { directory.listFiles() }.getOrNull() ?: return
+        val dataFolder by lazy { isDataFolder(directory) }
+        children.forEach { file ->
+            if (file.isDirectory) {
+                if (file.name in dataFolderInternals && dataFolder) {
+                    android.util.Log.i(ScanTag, "  skipping '${file.name}' of an emulator data folder")
+                    return@forEach
+                }
+                // A game folder is a leaf: emit it and do NOT descend. Descending
+                // also used to add USRDIR/EBOOT.BIN as its own bogus entry, since
+                // "bin" is in gameExtensions.
+                if (runCatching { isPs3GameFolder(file) }.getOrDefault(false)) {
+                    val folderUri = Uri.fromFile(file)
+                    android.util.Log.i(ScanTag, "  game folder '${file.name}'")
+                    output.putIfAbsent(
+                        folderUri.toString(),
+                        createGame(folderUri, file.name, "folder", null, probeDisc(file)),
+                    )
+                    addDiscGameFolders(file, output)
+                    return@forEach
+                }
+                scanRawDirectory(file, output, depth + 1)
+                return@forEach
+            }
+            val extension = file.extension.lowercase()
+            android.util.Log.i(ScanTag, "  raw file '${file.name}' ext=$extension accepted=${extension in gameExtensions}")
+            if (extension !in gameExtensions) return@forEach
+            // A compiled module from a cache folder the check above cannot see, one copied or
+            // backed up somewhere else. "gz" is in the list for disc images, and this is not one.
+            if (file.name.endsWith(".obj.gz", ignoreCase = true)) return@forEach
+            val uri = Uri.fromFile(file)
+
+            if (extension == "m3u") {
+                val text = runCatching { file.readText() }.getOrNull() ?: return@forEach
+                addPlaylist(uri, file.absolutePath, file.name, text, output)
+                return@forEach
+            }
+
+            if (extension == "pkg") {
+                val pkg = probePkg {
+                    ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
+                } ?: return@forEach
+                output.putIfAbsent(uri.toString(), createPackage(uri, file.name, pkg))
+                return@forEach
+            }
+
+            val disc = if (extension in probeExtensions) probeDisc(file) else null
+            val probe = if (disc == null && extension in probeExtensions) probeRaw(file) else null
+            output.putIfAbsent(uri.toString(), createGame(uri, file.name, extension, probe, disc))
+            if (disc != null) addDiscGameImages(uri, file.absolutePath, file.name, extension, output)
+        }
+    }
+
+    /**
+     * The other games on a multi-game disc folder (see [com.armsx2.DiscGames]): PS3_GM01,
+     * PS3_GM02 and so on beside PS3_GAME, each listed as the folder it is. The core boots one
+     * when handed that folder, walking up to the disc root to mount it.
+     *
+     * Probed like any folder game, which reads <dir>/PARAM.SFO and ICON0.PNG with no mount.
+     */
+    private fun addDiscGameFolders(disc: File, output: MutableMap<String, GameInfo>) {
+        runCatching { disc.listFiles() }.getOrNull().orEmpty()
+            .filter { it.isDirectory && com.armsx2.DiscGames.isGameDir(it.name) && File(it, "PARAM.SFO").isFile }
+            .sortedBy { it.name }
+            .forEach { dir ->
+                val uri = Uri.fromFile(dir)
+                android.util.Log.i(ScanTag, "  disc game '${disc.name}/${dir.name}'")
+                output.putIfAbsent(
+                    uri.toString(),
+                    createGame(uri, "${disc.name} ${dir.name}", "folder", null, probeDisc(dir)),
+                )
+            }
+    }
+
+    /** [addDiscGameFolders] over a SAF tree. */
+    private fun addDiscGameDocuments(disc: DocumentFile, output: MutableMap<String, GameInfo>) {
+        runCatching { disc.listFiles() }.getOrNull().orEmpty()
+            .filter { it.isDirectory && com.armsx2.DiscGames.isGameDir(it.name.orEmpty()) }
+            .filter { runCatching { it.findFile("PARAM.SFO")?.isFile == true }.getOrDefault(false) }
+            .sortedBy { it.name }
+            .forEach { dir ->
+                val label = "${disc.name} ${dir.name}"
+                android.util.Log.i(ScanTag, "  disc game '$label'")
+                output.putIfAbsent(
+                    dir.uri.toString(),
+                    createGame(dir.uri, label, "folder", null, probeDevicePath(dir.uri, label)),
+                )
+            }
+    }
+
+    /**
+     * The other games on a multi-game disc IMAGE. The image is one file, so each is the image's
+     * URI with the game folder as its fragment; [GameInfo.launchPath] turns that into the
+     * "<image>//PS3_GM01" the native boot understands.
+     *
+     * Read from what [probeDisc] filed under "<path>//PS3_GMxx", which is either this scan's
+     * probe of the image or the last scan's entries seeded back in. So a disc seen before is
+     * never mounted again just to find its other games.
+     */
+    private fun addDiscGameImages(
+        uri: Uri,
+        path: String,
+        name: String,
+        extension: String,
+        output: MutableMap<String, GameInfo>,
+    ) {
+        val prefix = path + com.armsx2.DiscGames.SEPARATOR
+        discInfoCache.entries
+            .filter { it.key.startsWith(prefix) && com.armsx2.DiscGames.isGameDir(it.key.removePrefix(prefix)) }
+            .sortedBy { it.key }
+            .forEach { (key, info) ->
+                val dir = key.removePrefix(prefix)
+                val gameUri = uri.buildUpon().fragment(dir).build()
+                android.util.Log.i(ScanTag, "  disc game '$name' $dir -> ${info.titleId}")
+                output.putIfAbsent(gameUri.toString(), createGame(gameUri, "$name $dir", extension, null, info))
+            }
+    }
+
+    /**
+     * Drop the separator, but only from something that actually looks like a title ID.
+     *
+     * The check is not about which console the game is for -- this emulator runs PS3 titles
+     * and nothing else. It is about not manufacturing an identity out of a guess.
+     * FilenameParser takes the first four-letters + five-digits token it finds ANYWHERE in
+     * the name and reconstructs it in the PS2 dump shape it was written for, so what arrives
+     * here may be a real id (BLUS-30917), a token out of a release tag, or an id belonging to
+     * a different game entirely.
+     *
+     * Left hyphenated, a bad guess matches nothing: no cover, no disc icon, no config, and
+     * the card shows a placeholder. That is a visible failure and it is the safe one.
+     * Stripped, the same guess becomes a WELL-FORMED title id and quietly resolves whatever
+     * is filed under it -- another game's cover and curated name, and its config_db entry,
+     * which the core applies at boot. So normalise only what carries a real PS3 prefix:
+     * B for disc releases (BLUS/BLES/BCUS...), N for PSN (NPUB/NPEB...).
+     *
+     * Deliberately NOT gated on [GamePlatform]: that enum comes from the same probe that
+     * produced the serial, so in the one case this function exists for -- the probe failed
+     * and the name came off the filename -- it carries no information at all.
+     */
+    private fun normalizeSerial(raw: String): String {
+        val stripped = raw.replace("-", "")
+        return if (ps3SerialRegex.matches(stripped)) stripped else raw
+    }
+
+    /**
+     * Carry a game's per-serial data across an identity correction.
+     *
+     * The serial is not just the cover key: it keys config.game.<serial>, per-game core
+     * overrides, touch layouts and profiles, pad bindings, play time, the pinned name and
+     * the custom cover file. Renaming the game without moving those silently resets every
+     * one of them, and nothing prunes the old keys afterwards, so they become unreachable
+     * rather than merely unused.
+     *
+     * A same-named key already under the new id is overwritten. It can only have come from
+     * an earlier scan that probed the disc successfully, before this entry regressed to a
+     * filename-derived id; the hyphenated one is what the game has actually been running
+     * with since, so it is the live value and the older one is stale.
+     */
+    private fun migrateSerialKeys(old: String, new: String) {
+        runCatching {
+            val prefs = MainActivityRuntime.prefs
+            val snapshot = prefs.all
+            val moved = snapshot.keys.filter { it.contains(old) }
+            if (moved.isNotEmpty()) {
+                prefs.edit().apply {
+                    moved.forEach { key ->
+                        when (val value = snapshot[key]) {
+                            is String -> putString(key.replace(old, new), value)
+                            is Int -> putInt(key.replace(old, new), value)
+                            is Long -> putLong(key.replace(old, new), value)
+                            is Boolean -> putBoolean(key.replace(old, new), value)
+                            is Float -> putFloat(key.replace(old, new), value)
+                            is Set<*> -> @Suppress("UNCHECKED_CAST")
+                                putStringSet(key.replace(old, new), value as Set<String>)
+                            else -> return@forEach
+                        }
+                        remove(key)
+                    }
+                }.apply()
+            }
+            CustomCovers.renameSerial(context, old, new)
+            android.util.Log.i(ScanTag, "serial '$old' -> '$new' (${moved.size} pref key(s) moved)")
+        }
+    }
+
+    private fun createGame(
+        uri: Uri,
+        name: String,
+        extension: String,
+        rawProbe: String?,
+        disc: DiscInfo? = null,
+    ): GameInfo {
+        val (probeSerial, probePlatform) = parseProbe(rawProbe)
+        val (fileTitle, fileSerial) = FilenameParser.parse(name)
+        val platform = if (disc != null) GamePlatform.PS3 else probePlatform ?: GamePlatform.PS3
+        // The disc's own PARAM.SFO wins: it is the authoritative title ID, where
+        // a filename-derived one is a guess off a dump's naming convention.
+        //
+        // Normalise the result: FilenameParser reconstructs every serial in the PS2 dump
+        // shape (SLUS-20312) because that is the convention its regex was written for, so a
+        // PS3 game whose serial came off the filename is recorded as BLUS-30917 and matches
+        // nothing -- not the cover repo (keyed by the exact PARAM.SFO id), not disc-icons,
+        // not config.game.<serial>. Doing it here rather than in FilenameParser is what
+        // repairs the entries already cached: they are re-seeded into discInfoCache on every
+        // scan and arrive back here as disc.titleId, which has top priority.
+        val rawSerial = disc?.titleId ?: probeSerial ?: fileSerial
+        val serial = rawSerial?.let(::normalizeSerial)
+        if (rawSerial != null && serial != null && rawSerial != serial) {
+            migrateSerialKeys(rawSerial, serial)
+        }
+        val compatibility = serial
+            ?.let { runCatching { NativeApp.getCompatibilityForSerial(it) }.getOrDefault(0) }
+            ?.minus(1)
+            ?.coerceIn(0, 5)
+            ?: 0
+        // GameDB title first, filename only as the fallback — the same order GameList.cpp
+        // uses. The database is the curated name: it drops dump cruft ("(USA) [!] v1.1"),
+        // and for a Japanese game it is the ACTUAL Japanese title, which no filename-derived
+        // guess can produce. Issue #338.
+        val db = serial?.let { dbTitles(it) }
+        return GameInfo(
+            uri = uri,
+            title = disc?.title?.takeIf { it.isNotBlank() }
+                ?: db?.name?.takeIf { it.isNotEmpty() }
+                ?: fileTitle,
+            serial = serial,
+            compatibility = compatibility,
+            extension = extension.uppercase(),
+            platform = platform,
+            // Only meaningful alongside a DB title; a filename-derived one has no sort key
+            // and is not a translation of anything.
+            titleSort = db?.sort.orEmpty(),
+            titleEn = db?.en.orEmpty(),
+        )
+    }
+
+    /**
+     * A library entry for a package that is not installed yet.
+     *
+     * Identity comes from the package's own PARAM.SFO, so the tile carries the title id the
+     * game will have once installed. That is what lets its cover, its compatibility rating
+     * and later its per-game settings all line up with the installed title rather than
+     * starting over. The extension stays PKG, which is how the rest of the app knows this one
+     * installs rather than boots.
+     */
+    private fun createPackage(uri: Uri, name: String, pkg: PkgInfo): GameInfo {
+        val serial = normalizeSerial(pkg.titleId)
+        val db = dbTitles(serial)
+        val compatibility = runCatching { NativeApp.getCompatibilityForSerial(serial) }
+            .getOrDefault(0)
+            .minus(1)
+            .coerceIn(0, 5)
+
+        android.util.Log.i(ScanTag, "  package '$name' -> ${pkg.titleId} '${pkg.title}' (${pkg.category})")
+
+        return GameInfo(
+            uri = uri,
+            title = pkg.title.takeIf { it.isNotBlank() }
+                ?: db?.name?.takeIf { it.isNotEmpty() }
+                ?: FilenameParser.parse(name).first,
+            serial = serial,
+            compatibility = compatibility,
+            extension = "PKG",
+            platform = GamePlatform.PS3,
+            titleSort = db?.sort.orEmpty(),
+            titleEn = db?.en.orEmpty(),
+            contentId = pkg.contentId,
+            drmFree = pkg.drmFree,
+        )
+    }
+
+    private data class DbTitles(val name: String, val sort: String, val en: String)
+
+    /** GameDB's three titles for [serial], or null when it isn't in the database. */
+    private fun dbTitles(serial: String): DbTitles? {
+        val raw = runCatching { NativeApp.getTitlesForSerial(serial) }.getOrNull()
+        if (raw.isNullOrEmpty()) return null
+        // "<name>\n<name-sort>\n<name-en>" — split with a limit so a title can't lose a
+        // trailing field, and tolerate a short string from an older core.
+        val parts = raw.split('\n')
+        val name = parts.getOrNull(0).orEmpty()
+        if (name.isEmpty()) return null
+        return DbTitles(name, parts.getOrNull(1).orEmpty(), parts.getOrNull(2).orEmpty())
+    }
+
+    private fun parseProbe(value: String?): Pair<String?, GamePlatform?> {
+        if (value.isNullOrBlank()) return null to null
+        val separator = value.indexOf(':')
+        if (separator <= 0) return value to null
+        return value.substring(separator + 1) to GamePlatform.fromKey(value.substring(0, separator))
+    }
+
+    /**
+     * Probe a document through the SAF device, which is the only way the core can read one.
+     *
+     * Null when the document is not inside a registered folder. That is not a failure worth
+     * reporting: it is what a build that reads the filesystem directly always gets here,
+     * because it never took this path in the first place.
+     */
+    private data class PkgInfo(
+        val titleId: String,
+        val title: String,
+        val category: String,
+        val contentId: String,
+        val drmFree: Boolean,
+    )
+
+    /**
+     * What an uninstalled .pkg is, read from the package's own PARAM.SFO.
+     *
+     * Null for anything that should not become a tile: an unreadable package, an update, a
+     * DLC, or a title that is already installed. The last one is what keeps the library from
+     * showing a package beside the game it already produced.
+     */
+    private fun probePkg(open: () -> ParcelFileDescriptor?): PkgInfo? {
+        val raw = runCatching {
+            val descriptor = open() ?: return null
+            RPCSX.instance.probePkgInfo(descriptor.detachFd())
+        }.getOrNull() ?: return null
+
+        val info = runCatching {
+            val o = JSONObject(raw)
+            val id = o.optString("titleId").trim().uppercase()
+            if (id.isEmpty()) return@runCatching null
+            PkgInfo(
+                id,
+                o.optString("title").trim(),
+                o.optString("category").trim().uppercase(),
+                o.optString("contentId").trim(),
+                // 3 is DRM-free; see _rpcsx_probePkgInfo.
+                o.optInt("drmType", 0) == 3,
+            )
+        }.getOrNull() ?: return null
+
+        if (info.category in nonGameCategories) {
+            android.util.Log.i(ScanTag, "  pkg ${info.titleId} is ${info.category}, not a game")
+            return null
+        }
+
+        if (Ps3Sfo.installDir(info.titleId) != null) {
+            android.util.Log.i(ScanTag, "  pkg ${info.titleId} is already installed")
+            return null
+        }
+
+        return info
+    }
+
+    /** Where [probeDisc] filed this game, so the seeding above and the probe agree. A second
+     *  game on a disc image is filed under "<image>//PS3_GMxx", like its launch path. */
+    private fun discCacheKey(game: GameInfo): String? =
+        entryPath(game)?.let { com.armsx2.DiscGames.join(it, game.discGameDir) }
+
+    /** The path the core opens for this entry, without any disc game folder: the file path, or
+     *  the SAF device path for a document in a picked folder. */
+    private fun entryPath(game: GameInfo): String? {
+        val uri = game.uri.buildUpon().fragment(null).build()
+        return if (uri.scheme == "content") {
+            com.armsx2.storage.ContentUri.devicePathForDocument(uri)
+        } else {
+            runCatching { uri.path }.getOrNull()
+        }
+    }
+
+    /**
+     * The discs an .m3u lists, resolved against its folder. The same rules as the native boot's
+     * read_disc_playlist, which is what actually boots it: blank and '#' lines skipped, a path
+     * relative to the playlist unless it starts with '/', a leading "./" dropped, and a bare title
+     * id meaning that installed PSN game.
+     */
+    private fun playlistDiscs(text: String, folder: String): List<String> =
+        text.removePrefix("\uFEFF").lineSequence()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && !it.startsWith("#") }
+            .map { line ->
+                // A bare title id names an installed PSN game, as read_disc_playlist resolves it.
+                File(RPCSX.getHdd0Dir(), "game/$line")
+                    .takeIf { titleIdLine.matches(line) && it.isDirectory }
+                    ?.path
+                    ?: if (line.startsWith("/")) line else "$folder/" + line.removePrefix("./")
+            }
+            .toList()
+
+    /**
+     * A multi-disc playlist as a tile of its own. Launching it boots the first disc, and Swap Disc
+     * then offers the rest in-game.
+     *
+     * The discs it lists keep their own tiles. PCSX2 and DuckStation hide them behind the playlist,
+     * but a PS3 disc in a set is a game in its own right: Dynasty Warriors 8 still boots without its
+     * Xtreme Legends disc, and each God of War Saga disc is a different game. Hidden, every disc
+     * but the first would have been unreachable.
+     *
+     * Named after the playlist, since the set is what it stands for, and identified by its first
+     * disc: that disc's title ID keys the cover, the per-game settings and the compatibility
+     * entry.
+     *
+     * [path] is what the core opens, a file path or a SAF device path, so the discs resolve to the
+     * same kind of path the native boot will read.
+     */
+    private fun addPlaylist(
+        uri: Uri,
+        path: String,
+        name: String,
+        text: String,
+        output: MutableMap<String, GameInfo>,
+        title: String = name.substringBeforeLast('.'),
+        auto: Boolean = false,
+    ) {
+        val discs = playlistDiscs(text, path.substringBeforeLast('/'))
+        val first = discs.firstOrNull()
+        if (first == null) {
+            android.util.Log.w(ScanTag, "  playlist '$name' lists no discs")
+            return
+        }
+        if (!auto) userPlaylistDiscs += discs
+        android.util.Log.i(ScanTag, "  ${if (auto) "auto " else ""}playlist '$name': ${discs.size} disc(s), first '$first'")
+        val game = createGame(uri, name, "m3u", null, probeDisc(first, name))
+        output.putIfAbsent(uri.toString(), game.copy(title = title, titleSort = "", titleEn = ""))
+    }
+
+    /** Every path a user's own playlist in this scan lists; an automatic one never repeats them. */
+    private val userPlaylistDiscs = HashSet<String>()
+
+    /**
+     * Playlists the library writes by itself, for sets that plainly belong together:
+     *  - disc images or folders side by side, named alike apart from "(Disc 1)", "(Disc 2)" and so on;
+     *  - installed PSN games whose titles differ only by "Part 1", "Part 2" (or Episode, Chapter,
+     *    Volume). That is how a multi-part PSN release installs: separate titles and no discs, so the
+     *    playlist lists them by title id.
+     *
+     * Written to the emulator's own playlists folder, never into a games folder the user owns, and
+     * rewritten every scan, so a set that loses a disc loses its playlist. A set that a user playlist
+     * already covers is left alone. The discs keep their own tiles, as with any playlist.
+     */
+    private fun addAutoPlaylists(collected: MutableMap<String, GameInfo>) {
+        val dir = File(RPCSX.rootDirectory, "playlists")
+        if (!com.armsx2.AutoPlaylists.enabled.value) {
+            dir.listFiles()?.filter { it.extension.equals("m3u", ignoreCase = true) }?.forEach { it.delete() }
+            return
+        }
+
+        // file name -> (tile title, playlist lines)
+        val playlists = linkedMapOf<String, Pair<String, List<String>>>()
+        fun fileNameFor(title: String) =
+            title.replace(Regex("""[\\/:*?"<>|]"""), "_").trim().ifBlank { "playlist" } + ".m3u"
+
+        data class Member(val group: String, val title: String, val number: Int, val line: String)
+
+        fun addSets(members: List<Member>) = members.groupBy { it.group }.values
+            .filter { set -> set.size >= 2 && set.map { it.number }.distinct().size == set.size }
+            .forEach { set ->
+                val title = set.first().title
+                playlists[fileNameFor(title)] = title to set.sortedBy { it.number }.map { it.line }
+            }
+
+        val games = collected.values.filter { !it.extension.equals("m3u", ignoreCase = true) }
+
+        addSets(
+            games.filter { !it.isPsn && it.discGameDir == null }.mapNotNull { game ->
+                val path = entryPath(game) ?: return@mapNotNull null
+                if (path in userPlaylistDiscs) return@mapNotNull null
+                val leaf = path.substringAfterLast('/')
+                val name = if (game.extension.equals("folder", ignoreCase = true)) leaf else leaf.substringBeforeLast('.')
+                val match = discToken.find(name) ?: return@mapNotNull null
+                val title = name.removeRange(match.range).trim()
+                Member(path.substringBeforeLast('/') + "|" + title.lowercase(), title, match.groupValues[2].toInt(), path)
+            },
+        )
+
+        val installed = File(RPCSX.getHdd0Dir(), "game").path
+        addSets(
+            games.filter { it.isPsn && it.extension.equals("folder", ignoreCase = true) }.mapNotNull { game ->
+                val serial = game.serial ?: return@mapNotNull null
+                if (entryPath(game)?.startsWith(installed) != true) return@mapNotNull null
+                val match = partToken.find(game.title) ?: return@mapNotNull null
+                val number = partNumber(match.groupValues[2]) ?: return@mapNotNull null
+                val title = game.title.removeRange(match.range).trim(' ', '-', ':', ',')
+                Member(title.lowercase(), title, number, serial)
+            },
+        )
+
+        dir.mkdirs()
+        dir.listFiles()
+            ?.filter { it.extension.equals("m3u", ignoreCase = true) && it.name !in playlists.keys }
+            ?.forEach { it.delete() }
+
+        for ((fileName, entry) in playlists) {
+            val (title, lines) = entry
+            val file = File(dir, fileName)
+            val text = lines.joinToString("\n", postfix = "\n")
+            if (runCatching { file.readText() }.getOrNull() != text) runCatching { file.writeText(text) }
+            addPlaylist(Uri.fromFile(file), file.absolutePath, fileName, text, collected, title = title, auto = true)
+        }
+    }
+
+    /** "Part 2", "Part II", "Episode 3"... -> 2, 2, 3. */
+    private fun partNumber(token: String): Int? = token.toIntOrNull()
+        ?: mapOf("i" to 1, "ii" to 2, "iii" to 3, "iv" to 4, "v" to 5, "vi" to 6, "vii" to 7, "viii" to 8, "ix" to 9, "x" to 10)[token.lowercase()]
+
+    private fun probeDevicePath(uri: Uri, label: String): DiscInfo? {
+        val path = com.armsx2.storage.ContentUri.devicePathForDocument(uri) ?: return null
+        return probeDisc(path, label)
+    }
+
+    private fun probeDocument(uri: Uri): String? = runCatching {
+        val descriptor = context.contentResolver.openFileDescriptor(uri, "r") ?: return null
+        NativeApp.getGameSerialFromFd(descriptor.detachFd())
+    }.getOrNull()
+
+    private fun probeRaw(file: File): String? = runCatching {
+        val descriptor = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
+        NativeApp.getGameSerialFromFd(descriptor.detachFd())
+    }.getOrNull()
+
+    /**
+     * Read a PS3 disc's title ID, title and cover from the image itself.
+     *
+     * The inherited probe looks for a PS2 SYSTEM.CNF, so every PS3 ISO came back
+     * with no serial -- and no serial meant no title, no compatibility entry and
+     * no cover. This asks the core to mount the ISO and read PS3_GAME/PARAM.SFO,
+     * extracting PS3_GAME/ICON0.PNG alongside it.
+     *
+     * Takes a path rather than a File because a game in a picked folder has one too now: a
+     * path under the SAF device, which the core opens through the same grant the scan is
+     * reading with. Before that existed this ran only on the raw scan, which is why a Play
+     * build listed games with no artwork and no serial.
+     */
+    private fun probeDisc(file: File): DiscInfo? = probeDisc(file.absolutePath, file.name)
+
+    private fun probeDisc(path: String, label: String): DiscInfo? {
+        if (path.isEmpty()) return null
+
+        // One extraction per game: re-reading a 7 GB image on every rescan to
+        // recover a PNG we already have would make each scan take minutes.
+        val existing = discInfoCache[path]
+        if (existing != null) return existing
+
+        val raw = runCatching {
+            RPCSX.instance.probeDiscInfo(path, DiscIcons.fileFor(PendingIcon).absolutePath)
+        }.getOrNull()
+        android.util.Log.i(ScanTag, "  probeDiscInfo('$label') -> $raw")
+        if (raw == null) return reprobeFallback.remove(path)?.also { discInfoCache[path] = it }
+
+        val info = runCatching {
+            val o = JSONObject(raw)
+            val id = o.optString("titleId")
+            if (id.isBlank()) return@runCatching null
+            // The probe writes to a fixed staging name because it cannot know the
+            // title ID until it has already parsed the SFO.
+            val staged = DiscIcons.fileFor(PendingIcon)
+            if (o.optBoolean("icon")) placeIcon(staged, id)
+            // The other games on a multi-game image, each staged at <staging>.<dir>. Filed
+            // beside this one so the scan lists them, and so a later scan finds them in the
+            // seeded cache without mounting the image again (see addDiscGameImages).
+            o.optJSONArray("discGames")?.let { games ->
+                for (i in 0 until games.length()) {
+                    val game = games.optJSONObject(i) ?: continue
+                    val dir = game.optString("dir")
+                    val gameId = game.optString("titleId")
+                    if (!com.armsx2.DiscGames.isGameDir(dir) || gameId.isBlank()) continue
+                    if (game.optBoolean("icon")) placeIcon(File("${staged.absolutePath}.$dir"), gameId)
+                    discInfoCache[com.armsx2.DiscGames.join(path, dir)] = DiscInfo(gameId, game.optString("title"))
+                    android.util.Log.i(ScanTag, "  disc probe: $label $dir -> $gameId")
+                }
+            }
+            DiscInfo(id, o.optString("title"))
+        }.getOrNull()
+            // A deliberate re-probe (see reprobeFallback) that came back empty keeps what the last
+            // scan knew, rather than falling to a filename guess.
+            ?: reprobeFallback.remove(path)?.also {
+                android.util.Log.w(ScanTag, "  re-probe of $label failed, keeping ${it.titleId}")
+            }
+            ?: return null
+
+        discInfoCache[path] = info
+        android.util.Log.i(ScanTag, "  disc probe: $label -> ${info.titleId} '${info.title}'")
+        return info
+    }
+
+    /**
+     * Move an icon the probe staged into place under [titleId].
+     *
+     * renameTo answers false instead of throwing when the target already exists, and the answer
+     * was discarded: a re-extraction for a title that already had an icon silently kept the old
+     * file and left the staging one behind. Clear the target first, and say so if it still fails
+     * -- a stale or empty icon must not outlive the probe that was meant to replace it, because
+     * every reader downstream treats "a file is there" as "the cover is good".
+     */
+    private fun placeIcon(staged: File, titleId: String) {
+        val target = DiscIcons.fileFor(titleId)
+        if (staged.length() > 0L) {
+            target.delete()
+            if (!staged.renameTo(target)) {
+                android.util.Log.w(ScanTag, "  could not place disc icon for $titleId")
+                staged.delete()
+            }
+        } else {
+            android.util.Log.w(ScanTag, "  probe claimed an icon for $titleId, staged 0 bytes")
+            staged.delete()
+        }
+    }
+
+    private data class DiscInfo(val titleId: String, val title: String)
+
+    private val discInfoCache = HashMap<String, DiscInfo>()
+
+    /** What the cache knew about an image this scan chose to re-probe, by probe path. Used only
+     *  if the probe comes back empty -- a boot can start mid-scan, and the probe refuses to
+     *  mount then -- so a failed re-probe never demotes a game to a filename guess. */
+    private val reprobeFallback = HashMap<String, DiscInfo>()
+
+    /**
+     * Every directory the scan listed, with its modification time, read before it was listed.
+     * Adding, removing or renaming a file changes its directory's time, so comparing these later
+     * is how the library notices a disc swapped in a folder it already knew (an .iso replaced
+     * by its .chd) without walking the folders again. The cache key only follows the folder list.
+     */
+    private val listedDirectories = mutableListOf<Pair<String, Long>>()
+
+    /**
+     * Whether anything the last scan listed has changed since: a directory's time moved, or one
+     * that was missing then (a card not yet mounted reads 0) is there now. Stats only the
+     * recorded directories, so it is cheap enough to ask on every return to the library. True
+     * for a cache saved before directories were recorded, so that one scan records them.
+     */
+    fun changedSinceScan(): Boolean {
+        val listed = MainActivityRuntime.prefs.getString(ListedDirectoriesKey, null)
+            ?.let { runCatching { JSONArray(it) }.getOrNull() }
+            ?: return true
+        for (index in 0 until listed.length()) {
+            val entry = listed.optJSONArray(index) ?: return true
+            val where = entry.optString(0)
+            val recorded = entry.optLong(1)
+            val now = if (where.startsWith("content:")) {
+                runCatching { DocumentFile.fromSingleUri(context, where.toUri())?.lastModified() }.getOrNull() ?: 0L
+            } else {
+                File(where).lastModified()
+            }
+            // Gone now. A deleted folder changed the one that held it, which says so itself, and a
+            // card that is not mounted is no reason to rescan its games out of the library.
+            if (now == 0L) continue
+            if (now != recorded) {
+                android.util.Log.i(ScanTag, "changed since the last scan: '$where'")
+                return true
+            }
+        }
+        return false
+    }
+
+    /**
+     * Entries whose file is gone while the folder that held it is still there: a disc deleted,
+     * or replaced by another. Only games on a path. A missing folder is more likely a card that
+     * is not mounted yet than games that were deleted, so those stay.
+     */
+    fun missingGames(games: List<GameInfo>): Set<String> = games.mapNotNull { game ->
+        if (game.uri.scheme != "file") return@mapNotNull null
+        val file = File(game.uri.path ?: return@mapNotNull null)
+        game.uri.toString().takeIf { !file.exists() && file.parentFile?.isDirectory == true }
+    }.toSet()
+
+    private fun saveCache(directories: List<String>, games: List<GameInfo>) {
+        val array = JSONArray()
+        games.forEach { game ->
+            array.put(JSONObject().apply {
+                put("uri", game.uri.toString())
+                put("title", game.title)
+                put("serial", game.serial ?: JSONObject.NULL)
+                put("compat", game.compatibility)
+                put("ext", game.extension)
+                put("platform", game.platform.key)
+                put("titleSort", game.titleSort)
+                put("titleEn", game.titleEn)
+                put("locked", game.locked)
+                put("trial", game.trial)
+                put("contentId", game.contentId)
+                put("drmFree", game.drmFree)
+            })
+        }
+        val listed = JSONArray()
+        listedDirectories.forEach { (where, time) -> listed.put(JSONArray().put(where).put(time)) }
+        MainActivityRuntime.prefs.edit {
+            putString("gamesCacheKey", cacheKey(directories))
+                .putString("gamesCache", array.toString())
+                .putString(ListedDirectoriesKey, listed.toString())
+            }
+    }
+
+    private fun canUseRawStorage(): Boolean =
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && Environment.isExternalStorageManager()
+
+    data class CachedLibrary(val key: String?, val games: List<GameInfo>)
+
+    private companion object {
+        /** Whether the colliding-serial repair below may still run in this process.
+         *
+         *  It re-probes, and probing an ISO mounts it process-wide. Doing that after a game has
+         *  been booted is the crash the seeding exists to prevent: a tester hit it by closing a
+         *  game and returning to the library, which corrupted the entries a second time and then
+         *  took the app down. Checking EmuState is NOT enough -- IsStopped() reads true while the
+         *  core is still STOPPING, so a post-game scan can see STOPPED mid-teardown.
+         *
+         *  So the repair gets exactly one attempt per process, at a scan that happens before
+         *  anything has been booted. A library that still needs repairing gets it on the next
+         *  cold start, which costs the user nothing and cannot mount an ISO under a live core. */
+        @Volatile private var collisionRepairSpent = false
+        /** v2: PS3 title ID + title + ICON0.PNG read from the disc's PARAM.SFO.
+         *  v5: folder-format games (JB folder / installed game folder).
+         *  v6: PARAM.SFO CATEGORY read, to drop game-data installs.
+         *  v7: licence-locked state, asked of the core per installed title.
+         *  v8: PS3 serials normalised (BLUS-30917 -> BLUS30917). The scanner does not
+         *      extract a NEW field here, it changes the VALUE of one it already stored, which
+         *      has the same staleness signature: without a bump an existing install keeps
+         *      serving the cached hyphenated ids and never rescans, so the repair never
+         *      reaches the libraries that need it.
+         *  v9: every game on a multi-game disc (PS3_GM01...), not just PS3_GAME. Images
+         *      cached before this are probed once more to find them; see [DiscGamesSchemaVersion].
+         *  v10: a package's content id and DRM-free flag, for its licence badge. */
+        /** PS3 disc ids are B***, PSN ids N***, both four letters and five digits. */
+        val ps3SerialRegex = Regex("^[BN][A-Z]{3}[0-9]{5}$")
+
+        /** A playlist line that is a title id: four letters, five digits, same as read_disc_playlist. */
+        val titleIdLine = Regex("^[A-Z]{4}[0-9]{5}$")
+
+        /** "(Disc 1)", "[Disc 2 of 3]", "(CD 1)" in a dump's name. Brackets required: a bare "Disc"
+         *  is a word in real titles. */
+        val discToken = Regex("""\s*[(\[]\s*(disc|disk|cd)\s*(\d+)(?:\s*of\s*\d+)?\s*[)\]]""", RegexOption.IGNORE_CASE)
+
+        /** "Part 2", "Episode 3", "Chapter IV" in an installed title's name. */
+        val partToken = Regex("""\b(part|episode|chapter|volume|vol\.?)\s*(\d+|[ivx]+)\b""", RegexOption.IGNORE_CASE)
+
+        // 11: a cache that listed a data folder's firmware and compiled modules as games has
+        // to be rescanned for them to go.
+        // 12: trials are flagged (GameInfo.trial). A cache from before never asked, so every
+        // trial kept looking like the full game until something else forced a rescan.
+        const val ScanSchemaVersion = 12
+        /** The first scanner that looked for other games on a disc image. A cache from before it
+         *  has never been asked, so its images are re-probed once. */
+        const val DiscGamesSchemaVersion = 9
+        /** The scanner version whose disc-image probe has run over this library. */
+        const val ProbedSchemaKey = "gamesProbedSchema"
+        const val ScanTag = "ARMSX3-Scan"
+        /** The directories the last scan listed, with their times (see [changedSinceScan]). */
+        const val ListedDirectoriesKey = "gamesCacheDirs"
+        /** Staging name for an extracted icon, renamed once the title ID is known. */
+        const val PendingIcon = "__pending"
+        const val MaxScanDepth = 12
+        val probeExtensions = setOf("iso", "bin", "chd", "img", "mdf", "nrg", "dump")
+    }
+}
+
+/**
+ * The one PARAM.SFO field a caller asks for, by key.
+ *
+ * Grown out of the scanner's CATEGORY reader rather than added beside it: the package screen
+ * needs TITLE for the same files, and a second copy of this parsing would be a second place to
+ * get the 16-byte index-entry layout wrong.
+ *
+ * Every failure -- unreadable file, wrong magic, an offset that points past the end -- answers
+ * null. A truncated or hand-edited SFO must never take a caller down with it: the scanner uses
+ * the answer to decide whether to LIST a game, and the package screen to decide what to CALL
+ * one, and both have a sane fallback while an exception has none.
+ */
+internal object ParamSfo {
+    fun string(sfo: File, key: String): String? =
+        runCatching { string(sfo.readBytes(), key) }.getOrNull()
+
+    fun string(bytes: ByteArray, key: String): String? {
+        val buffer = java.nio.ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        // "\0PSF", then key-table start, data-table start, entry count.
+        if (bytes.size < 20 || buffer.getInt(0) != 0x46535000) return null
+        val keyTable = buffer.getInt(8)
+        val dataTable = buffer.getInt(12)
+        for (index in 0 until buffer.getInt(16)) {
+            val entry = 20 + index * 16
+            if (entry + 16 > bytes.size) break
+            val keyStart = keyTable + (buffer.getShort(entry).toInt() and 0xFFFF)
+            if (keyStart < 0 || keyStart >= bytes.size) break
+            var keyEnd = keyStart
+            while (keyEnd < bytes.size && bytes[keyEnd] != 0.toByte()) keyEnd++
+            if (String(bytes, keyStart, keyEnd - keyStart) != key) continue
+            val dataStart = dataTable + buffer.getInt(entry + 12)
+            val dataLength = buffer.getInt(entry + 4)
+            if (dataStart < 0 || dataLength < 0 || dataStart + dataLength > bytes.size) break
+            // Values are UTF-8 and padded with NULs to their declared maximum length.
+            return String(bytes, dataStart, dataLength, Charsets.UTF_8).trimEnd('\u0000', ' ')
+        }
+        return null
+    }
+}

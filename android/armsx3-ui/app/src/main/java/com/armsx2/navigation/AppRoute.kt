@@ -1,0 +1,105 @@
+package com.armsx2.navigation
+
+import androidx.compose.runtime.mutableStateOf
+import com.armsx2.GameInfo
+
+sealed interface AppRoute {
+    data object Home : AppRoute
+    data class Settings(
+        val category: SettingsCategory = SettingsCategory.General,
+        val game: GameInfo? = null,
+        /** Where back should land. Null means the library, which is right for the long press
+         *  that opens a game's settings from there. A screen that opens settings itself sets
+         *  this so backing out returns to it instead of dumping the user at the library. */
+        val returnTo: AppRoute? = null,
+    ) : AppRoute
+    // Carries an optional game so the per-game BIOS picker can key on it directly
+    // (from the library long-press) without the game being loaded; null = global,
+    // opened from the drawer (falls back to the currently loaded game if any).
+    // No per-game firmware exists on PS3 -- one PS3UPDAT.PUP is installed for the whole
+    // emulator -- so this route carries nothing. It used to take a GameInfo that
+    // BiosManagerScreen accepted and ignored.
+    data object BiosManager : AppRoute
+    data object PackageInstaller : AppRoute
+    data object CoreSettings : AppRoute
+    // A game when opened from its long-press in the library: the list is that game's slots and
+    // loading one boots straight into it. Null from the drawer, where it lists every game's.
+    data class SaveManager(val game: GameInfo? = null) : AppRoute
+    data object ControllerManager : AppRoute
+    data object ModLibrary : AppRoute
+    data object Underclocking : AppRoute
+    data object TextureManager : AppRoute
+    data object Achievements : AppRoute
+    // PS3 trophies, read from the emulator's own dev_hdd0 trophy folders. Distinct from
+    // Achievements above, which is the (hidden) RetroAchievements screen.
+    data object Trophies : AppRoute
+    data object Language : AppRoute
+    data object News : AppRoute
+    data object Friends : AppRoute
+    data object About : AppRoute
+}
+
+enum class SettingsCategory {
+    General,
+    Info,
+    Performance,
+    Graphics,
+    Audio,
+    Controls,
+    Hotkeys,
+    Network,
+    OnScreen,
+    Skins,
+    Advanced,
+    Patches,
+    Mods,
+    About,
+}
+
+object UiNavigator {
+    val route = mutableStateOf<AppRoute>(AppRoute.Home)
+    val drawerOpen = mutableStateOf(false)
+
+    fun navigate(destination: AppRoute) {
+        val changed = route.value != destination
+        route.value = destination
+        drawerOpen.value = false
+        // "Entering a settings menu / sub-screen" blip — but not for just returning Home.
+        if (changed && destination != AppRoute.Home) {
+            com.armsx2.MenuSfx.play(com.armsx2.MenuSfx.Event.SUBMENU)
+        }
+    }
+
+    fun home() = navigate(AppRoute.Home)
+
+    fun back(): Boolean {
+        if (drawerOpen.value) {
+            drawerOpen.value = false
+            return true
+        }
+        when (route.value) {
+            AppRoute.Language -> {
+                route.value = AppRoute.Settings(SettingsCategory.General)
+                return true
+            }
+            AppRoute.About -> {
+                route.value = AppRoute.Settings(SettingsCategory.General)
+                return true
+            }
+            // A settings screen opened from another screen goes back to that screen. Reached
+            // by long-pressing a game in the library there is no origin to record, returnTo is
+            // null, and the library is the right destination.
+            is AppRoute.Settings -> {
+                route.value = (route.value as AppRoute.Settings).returnTo ?: AppRoute.Home
+                return true
+            }
+            AppRoute.Home -> Unit
+            else -> {
+                route.value = AppRoute.Home
+                return true
+            }
+        }
+        drawerOpen.value = true
+        return true
+    }
+}

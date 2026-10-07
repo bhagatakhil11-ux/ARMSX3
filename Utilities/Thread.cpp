@@ -1,0 +1,5501 @@
+#include "stdafx.h"
+#include "Emu/System.h"
+#include "Emu/Cell/SPUThread.h"
+#include "Emu/Cell/PPUThread.h"
+#include "Emu/Cell/PPUDisAsm.h"
+#include "Emu/Cell/lv2/sys_mmapper.h"
+#include "Emu/Cell/lv2/sys_event.h"
+#include "Emu/Cell/lv2/sys_process.h"
+#include "Emu/RSX/RSXThread.h"
+#include "Emu/system_config.h"
+#include "Thread.h"
+#include <bit>
+#include <cstring>
+#include <cerrno>
+#include "Utilities/JIT.h"
+#include <cfenv>
+#include <charconv>
+
+#ifdef ARCH_ARM64
+#include "Emu/CPU/Backends/AArch64/AArch64Signal.h"
+#endif
+
+#ifdef __cpp_lib_stacktrace
+#include "rpcs3_version.h"
+#include <stacktrace>
+#endif
+
+// Not only under _WIN32 below: the access-violation handler prints a host backtrace on every
+// platform, and on Android that is the only stack anyone gets -- the handler freezes the
+// emulator rather than aborting, so no tombstone is ever written.
+#include "stack_trace.h"
+
+#ifdef _WIN32
+#include <Windows.h>
+#include <Psapi.h>
+#include <process.h>
+#include <sysinfoapi.h>
+
+#include "stack_trace.h"
+#include "util/dyn_lib.hpp"
+
+DYNAMIC_IMPORT_RENAME("Kernel32.dll", SetThreadDescriptionImport, "SetThreadDescription", HRESULT(HANDLE hThread, PCWSTR lpThreadDescription));
+
+#else
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#ifdef __APPLE__
+#define _XOPEN_SOURCE
+#define __USE_GNU
+#include <mach/thread_act.h>
+#include <mach/thread_policy.h>
+#endif
+#if defined(__DragonFly__) || defined(__FreeBSD__) || defined(__OpenBSD__)
+#include <pthread_np.h>
+#define cpu_set_t cpuset_t
+#endif
+#include <errno.h>
+#include <signal.h>
+#ifndef __OpenBSD__
+#include <ucontext.h>
+#endif
+#include <pthread.h>
+#include <sys/time.h>
+#include <sys/resource.h>
+#include <time.h>
+#endif
+#ifdef __linux__
+#include <sys/syscall.h>
+#include <sys/timerfd.h>
+#include <unistd.h>
+#endif
+#ifdef __ANDROID__
+// For the allocation-free breadcrumb the fault handler writes before it risks anything else, and
+// for reaching libsigchain's registration entry point without linking against the ART apex.
+#include <android/log.h>
+#include <dlfcn.h>
+#endif
+
+#if defined(__APPLE__) || defined(__DragonFly__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+# include <sys/sysctl.h>
+# include <unistd.h>
+# if defined(__DragonFly__) || defined(__FreeBSD__)
+#  include <sys/user.h>
+# endif
+# if defined(__OpenBSD__)
+#  include <sys/param.h>
+#  include <sys/proc.h>
+# endif
+
+# if defined(__NetBSD__)
+#  undef KERN_PROC
+#  define KERN_PROC KERN_PROC2
+#  define kinfo_proc kinfo_proc2
+# endif
+
+# if defined(__APPLE__)
+#  define KP_FLAGS kp_proc.p_flag
+# elif defined(__DragonFly__)
+#  define KP_FLAGS kp_flags
+# elif defined(__FreeBSD__)
+#  define KP_FLAGS ki_flag
+# elif defined(__NetBSD__)
+#  define KP_FLAGS p_flag
+# elif defined(__OpenBSD__)
+#  define KP_FLAGS p_psflags
+#  define P_TRACED PS_TRACED
+# endif
+#endif
+
+#include "util/vm.hpp"
+#include "util/logs.hpp"
+#include "util/asm.hpp"
+#include "util/v128.hpp"
+#include "util/simd.hpp"
+#include "util/cctype.hpp"
+#include "util/sysinfo.hpp"
+#include "Emu/Memory/vm_locking.h"
+
+LOG_CHANNEL(sig_log, "SIG");
+LOG_CHANNEL(sys_log, "SYS");
+LOG_CHANNEL(vm_log, "VM");
+
+thread_local u64 g_tls_fault_all = 0;
+thread_local u64 g_tls_fault_rsx = 0;
+thread_local u64 g_tls_fault_spu = 0;
+thread_local u64 g_tls_wait_time = 0;
+thread_local u64 g_tls_wait_fail = 0;
+thread_local u64 g_tls_access_violation_recovered = umax;
+extern thread_local std::string(*g_tls_log_prefix)();
+
+namespace stx
+{
+	atomic_t<u32> g_launch_retainer{0};
+}
+
+// Report error and call std::abort(), defined in main.cpp
+[[noreturn]] void report_fatal_error(std::string_view text, bool is_html = false, bool include_help_text = true);
+
+enum cpu_threads_emulation_info_dump_t : u32 {};
+
+std::string dump_useful_thread_info()
+{
+	std::string result;
+
+	if (auto cpu = get_current_cpu_thread())
+	{
+		fmt::append(result, "%s", cpu_threads_emulation_info_dump_t{cpu->id});
+	}
+
+	return result;
+}
+
+#ifndef _WIN32
+bool IsDebuggerPresent()
+{
+#if defined(__APPLE__) || defined(__DragonFly__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+	int mib[] = {
+		CTL_KERN,
+		KERN_PROC,
+		KERN_PROC_PID,
+		getpid(),
+# if defined(__NetBSD__) || defined(__OpenBSD__)
+		sizeof(struct kinfo_proc),
+		1,
+# endif
+	};
+	u_int miblen = std::size(mib);
+	struct kinfo_proc info;
+	usz size = sizeof(info);
+
+	if (sysctl(mib, miblen, &info, &size, NULL, 0))
+	{
+		return false;
+	}
+
+	return info.KP_FLAGS & P_TRACED;
+#else
+	char buf[4096];
+	fs::file status_fd("/proc/self/status");
+	if (!status_fd)
+	{
+		std::fprintf(stderr, "Failed to open /proc/self/status\n");
+		return false;
+	}
+
+	const auto num_read = status_fd.read(buf, sizeof(buf) - 1);
+	if (num_read == 0 || num_read == umax)
+	{
+		std::fprintf(stderr, "Failed to read /proc/self/status (%d)\n", errno);
+		return false;
+	}
+
+	buf[num_read] = '\0';
+	std::string_view status = buf;
+
+	const auto found = status.find("TracerPid:");
+	if (found == umax)
+	{
+		std::fprintf(stderr, "Failed to find 'TracerPid:' in /proc/self/status\n");
+		return false;
+	}
+
+	for (const char* cp = status.data() + found + 10; cp <= status.data() + num_read; ++cp)
+	{
+		if (!utils::isspace(*cp))
+		{
+			return utils::isdigit(*cp) != 0 && *cp != '0';
+		}
+	}
+
+	return false;
+#endif
+}
+#endif
+
+bool is_debugger_present()
+{
+	if (g_cfg.core.external_debugger)
+		return true;
+	return IsDebuggerPresent();
+}
+
+#if defined(ARCH_X64)
+enum x64_reg_t : u32
+{
+	X64R_RAX = 0,
+	X64R_RCX,
+	X64R_RDX,
+	X64R_RBX,
+	X64R_RSP,
+	X64R_RBP,
+	X64R_RSI,
+	X64R_RDI,
+	X64R_R8,
+	X64R_R9,
+	X64R_R10,
+	X64R_R11,
+	X64R_R12,
+	X64R_R13,
+	X64R_R14,
+	X64R_R15,
+
+	X64R_XMM0 = 0,
+	X64R_XMM1,
+	X64R_XMM2,
+	X64R_XMM3,
+	X64R_XMM4,
+	X64R_XMM5,
+	X64R_XMM6,
+	X64R_XMM7,
+	X64R_XMM8,
+	X64R_XMM9,
+	X64R_XMM10,
+	X64R_XMM11,
+	X64R_XMM12,
+	X64R_XMM13,
+	X64R_XMM14,
+	X64R_XMM15,
+
+	X64R_AL,
+	X64R_CL,
+	X64R_DL,
+	X64R_BL,
+	X64R_AH,
+	X64R_CH,
+	X64R_DH,
+	X64R_BH,
+
+	X64_NOT_SET,
+	X64_IMM8,
+	X64_IMM16,
+	X64_IMM32,
+
+	X64_BIT_O = 0x90,
+	X64_BIT_NO,
+	X64_BIT_C,
+	X64_BIT_NC,
+	X64_BIT_Z,
+	X64_BIT_NZ,
+	X64_BIT_BE,
+	X64_BIT_NBE,
+	X64_BIT_S,
+	X64_BIT_NS,
+	X64_BIT_P,
+	X64_BIT_NP,
+	X64_BIT_L,
+	X64_BIT_NL,
+	X64_BIT_LE,
+	X64_BIT_NLE,
+
+	X64R_ECX = X64R_CL,
+};
+
+enum x64_op_t : u32
+{
+	X64OP_NONE,
+	X64OP_LOAD, // obtain and put the value into x64 register
+	X64OP_LOAD_BE,
+	X64OP_LOAD_CMP,
+	X64OP_LOAD_TEST,
+	X64OP_STORE, // take the value from x64 register or an immediate and use it
+	X64OP_STORE_BE,
+	X64OP_MOVS,
+	X64OP_STOS,
+	X64OP_XCHG,
+	X64OP_CMPXCHG,
+	X64OP_AND, // lock and [mem], ...
+	X64OP_OR,  // lock or  [mem], ...
+	X64OP_XOR, // lock xor [mem], ...
+	X64OP_INC, // lock inc [mem]
+	X64OP_DEC, // lock dec [mem]
+	X64OP_ADD, // lock add [mem], ...
+	X64OP_ADC, // lock adc [mem], ...
+	X64OP_SUB, // lock sub [mem], ...
+	X64OP_SBB, // lock sbb [mem], ...
+	X64OP_BEXTR,
+};
+
+static thread_local x64_reg_t s_tls_reg3{};
+
+void decode_x64_reg_op(const u8* code, x64_op_t& out_op, x64_reg_t& out_reg, usz& out_size, usz& out_length)
+{
+	// simple analysis of x64 code allows to reinterpret MOV or other instructions in any desired way
+	out_length = 0;
+
+	u8 rex = 0, pg2 = 0;
+
+	bool oso = false, lock = false, repne = false, repe = false;
+
+	enum : u8
+	{
+		LOCK  = 0xf0,
+		REPNE = 0xf2,
+		REPE  = 0xf3,
+	};
+
+	// check prefixes:
+	for (;; code++, out_length++)
+	{
+		switch (const u8 prefix = *code)
+		{
+		case LOCK: // group 1
+		{
+			if (lock)
+			{
+				sig_log.error("decode_x64_reg_op(%016llxh): LOCK prefix found twice", code - out_length);
+			}
+
+			lock = true;
+			continue;
+		}
+		case REPNE: // group 1
+		{
+			if (repne)
+			{
+				sig_log.error("decode_x64_reg_op(%016llxh): REPNE/REPNZ prefix found twice", code - out_length);
+			}
+
+			repne = true;
+			continue;
+		}
+		case REPE: // group 1
+		{
+			if (repe)
+			{
+				sig_log.error("decode_x64_reg_op(%016llxh): REP/REPE/REPZ prefix found twice", code - out_length);
+			}
+
+			repe = true;
+			continue;
+		}
+
+		case 0x2e: // group 2
+		case 0x36:
+		case 0x3e:
+		case 0x26:
+		case 0x64:
+		case 0x65:
+		{
+			if (pg2)
+			{
+				sig_log.error("decode_x64_reg_op(%016llxh): 0x%02x (group 2 prefix) found after 0x%02x", code - out_length, prefix, pg2);
+			}
+			else
+			{
+				pg2 = prefix; // probably, segment register
+			}
+			continue;
+		}
+
+		case 0x66: // group 3
+		{
+			if (oso)
+			{
+				sig_log.error("decode_x64_reg_op(%016llxh): operand-size override prefix found twice", code - out_length);
+			}
+
+			oso = true;
+			continue;
+		}
+
+		case 0x67: // group 4
+		{
+			sig_log.error("decode_x64_reg_op(%016llxh): address-size override prefix found", code - out_length, prefix);
+			out_op = X64OP_NONE;
+			out_reg = X64_NOT_SET;
+			out_size = 0;
+			out_length = 0;
+			return;
+		}
+
+		default:
+		{
+			if ((prefix & 0xf0) == 0x40) // check REX prefix
+			{
+				if (rex)
+				{
+					sig_log.error("decode_x64_reg_op(%016llxh): 0x%02x (REX prefix) found after 0x%02x", code - out_length, prefix, rex);
+				}
+				else
+				{
+					rex = prefix;
+				}
+				continue;
+			}
+		}
+		}
+
+		break;
+	}
+
+	auto get_modRM_reg = [](const u8* code, const u8 rex) -> x64_reg_t
+	{
+		return x64_reg_t{((*code & 0x38) >> 3 | (/* check REX.R bit */ rex & 4 ? 8 : 0)) + X64R_RAX};
+	};
+
+	auto get_modRM_reg_xmm = [](const u8* code, const u8 rex) -> x64_reg_t
+	{
+		return x64_reg_t{((*code & 0x38) >> 3 | (/* check REX.R bit */ rex & 4 ? 8 : 0)) + X64R_XMM0};
+	};
+
+	auto get_modRM_reg_lh = [](const u8* code) -> x64_reg_t
+	{
+		return x64_reg_t{((*code & 0x38) >> 3) + X64R_AL};
+	};
+
+	auto get_op_size = [](const u8 rex, const bool oso) -> usz
+	{
+		return rex & 8 ? 8 : (oso ? 2 : 4);
+	};
+
+	auto get_modRM_size = [](const u8* code) -> usz
+	{
+		switch (*code >> 6) // check Mod
+		{
+		case 0: return (*code & 0x07) == 4 ? 2 : 1; // check SIB
+		case 1: return (*code & 0x07) == 4 ? 3 : 2; // check SIB (disp8)
+		case 2: return (*code & 0x07) == 4 ? 6 : 5; // check SIB (disp32)
+		default: return 1;
+		}
+	};
+
+	const u8 op1 = (out_length++, *code++), op2 = code[0], op3 = code[1];
+
+	switch (op1)
+	{
+	case 0x0f:
+	{
+		out_length++, code++;
+
+		switch (op2)
+		{
+		case 0x11:
+		case 0x29:
+		{
+			if (!repe && !repne) // MOVUPS/MOVAPS/MOVUPD/MOVAPD xmm/m, xmm
+			{
+				out_op = X64OP_STORE;
+				out_reg = get_modRM_reg_xmm(code, rex);
+				out_size = 16;
+				out_length += get_modRM_size(code);
+				return;
+			}
+			break;
+		}
+		case 0x7f:
+		{
+			if (repe != oso) // MOVDQU/MOVDQA xmm/m, xmm
+			{
+				out_op = X64OP_STORE;
+				out_reg = get_modRM_reg_xmm(code, rex);
+				out_size = 16;
+				out_length += get_modRM_size(code);
+				return;
+			}
+			break;
+		}
+		case 0xb0:
+		{
+			if (!oso) // CMPXCHG r8/m8, r8
+			{
+				out_op = X64OP_CMPXCHG;
+				out_reg = rex & 8 ? get_modRM_reg(code, rex) : get_modRM_reg_lh(code);
+				out_size = 1;
+				out_length += get_modRM_size(code);
+				return;
+			}
+			break;
+		}
+		case 0xb1:
+		{
+			if (true) // CMPXCHG r/m, r (16, 32, 64)
+			{
+				out_op = X64OP_CMPXCHG;
+				out_reg = get_modRM_reg(code, rex);
+				out_size = get_op_size(rex, oso);
+				out_length += get_modRM_size(code);
+				return;
+			}
+			break;
+		}
+		case 0x90:
+		case 0x91:
+		case 0x92:
+		case 0x93:
+		case 0x94:
+		case 0x95:
+		case 0x96:
+		case 0x97:
+		case 0x98:
+		case 0x9a:
+		case 0x9b:
+		case 0x9c:
+		case 0x9d:
+		case 0x9e:
+		case 0x9f:
+		{
+			if (!lock) // SETcc
+			{
+				out_op = X64OP_STORE;
+				out_reg = x64_reg_t(X64_BIT_O + op2 - 0x90); // 0x90 .. 0x9f
+				out_size = 1;
+				out_length += get_modRM_size(code);
+				return;
+			}
+			break;
+		}
+		case 0x38:
+		{
+			out_length++, code++;
+
+			switch (op3)
+			{
+			case 0xf0:
+			case 0xf1:
+			{
+				if (!repne) // MOVBE
+				{
+					out_op = op3 == 0xf0 ? X64OP_LOAD_BE : X64OP_STORE_BE;
+					out_reg = get_modRM_reg(code, rex);
+					out_size = get_op_size(rex, oso);
+					out_length += get_modRM_size(code);
+					return;
+				}
+
+				break;
+			}
+			}
+
+			break;
+		}
+		}
+
+		break;
+	}
+	case 0x20:
+	{
+		if (!oso)
+		{
+			out_op = X64OP_AND;
+			out_reg = rex & 8 ? get_modRM_reg(code, rex) : get_modRM_reg_lh(code);
+			out_size = 1;
+			out_length += get_modRM_size(code);
+			return;
+		}
+		break;
+	}
+	case 0x21:
+	{
+		if (true)
+		{
+			out_op = X64OP_AND;
+			out_reg = get_modRM_reg(code, rex);
+			out_size = get_op_size(rex, oso);
+			out_length += get_modRM_size(code);
+			return;
+		}
+		break;
+	}
+	case 0x80:
+	{
+		switch (get_modRM_reg(code, 0))
+		{
+		//case 0: out_op = X64OP_ADD; break; // TODO: strange info in instruction manual
+		case 1: out_op = X64OP_OR; break;
+		case 2: out_op = X64OP_ADC; break;
+		case 3: out_op = X64OP_SBB; break;
+		case 4: out_op = X64OP_AND; break;
+		case 5: out_op = X64OP_SUB; break;
+		case 6: out_op = X64OP_XOR; break;
+		default: out_op = X64OP_LOAD_CMP; break;
+		}
+
+		out_reg = X64_IMM8;
+		out_size = 1;
+		out_length += get_modRM_size(code) + 1;
+		return;
+	}
+	case 0x81:
+	{
+		switch (get_modRM_reg(code, 0))
+		{
+		case 0: out_op = X64OP_ADD; break;
+		case 1: out_op = X64OP_OR; break;
+		case 2: out_op = X64OP_ADC; break;
+		case 3: out_op = X64OP_SBB; break;
+		case 4: out_op = X64OP_AND; break;
+		case 5: out_op = X64OP_SUB; break;
+		case 6: out_op = X64OP_XOR; break;
+		default: out_op = X64OP_LOAD_CMP; break;
+		}
+
+		out_reg = oso ? X64_IMM16 : X64_IMM32;
+		out_size = get_op_size(rex, oso);
+		out_length += get_modRM_size(code) + (oso ? 2 : 4);
+		return;
+	}
+	case 0x83:
+	{
+		switch (get_modRM_reg(code, 0))
+		{
+		case 0: out_op = X64OP_ADD; break;
+		case 1: out_op = X64OP_OR; break;
+		case 2: out_op = X64OP_ADC; break;
+		case 3: out_op = X64OP_SBB; break;
+		case 4: out_op = X64OP_AND; break;
+		case 5: out_op = X64OP_SUB; break;
+		case 6: out_op = X64OP_XOR; break;
+		default: out_op = X64OP_LOAD_CMP; break;
+		}
+
+		out_reg = X64_IMM8;
+		out_size = get_op_size(rex, oso);
+		out_length += get_modRM_size(code) + 1;
+		return;
+	}
+	case 0x86:
+	{
+		if (!oso) // XCHG r8/m8, r8
+		{
+			out_op = X64OP_XCHG;
+			out_reg = rex & 8 ? get_modRM_reg(code, rex) : get_modRM_reg_lh(code);
+			out_size = 1;
+			out_length += get_modRM_size(code);
+			return;
+		}
+		break;
+	}
+	case 0x87:
+	{
+		if (true) // XCHG r/m, r (16, 32, 64)
+		{
+			out_op = X64OP_XCHG;
+			out_reg = get_modRM_reg(code, rex);
+			out_size = get_op_size(rex, oso);
+			out_length += get_modRM_size(code);
+			return;
+		}
+		break;
+	}
+	case 0x88:
+	{
+		if (!lock && !oso) // MOV r8/m8, r8
+		{
+			out_op = X64OP_STORE;
+			out_reg = rex & 8 ? get_modRM_reg(code, rex) : get_modRM_reg_lh(code);
+			out_size = 1;
+			out_length += get_modRM_size(code);
+			return;
+		}
+		break;
+	}
+	case 0x89:
+	{
+		if (!lock) // MOV r/m, r (16, 32, 64)
+		{
+			out_op = X64OP_STORE;
+			out_reg = get_modRM_reg(code, rex);
+			out_size = get_op_size(rex, oso);
+			out_length += get_modRM_size(code);
+			return;
+		}
+		break;
+	}
+	case 0x8a:
+	{
+		if (!lock && !oso) // MOV r8, r8/m8
+		{
+			out_op = X64OP_LOAD;
+			out_reg = rex & 8 ? get_modRM_reg(code, rex) : get_modRM_reg_lh(code);
+			out_size = 1;
+			out_length += get_modRM_size(code);
+			return;
+		}
+		break;
+	}
+	case 0x8b:
+	{
+		if (!lock) // MOV r, r/m (16, 32, 64)
+		{
+			out_op = X64OP_LOAD;
+			out_reg = get_modRM_reg(code, rex);
+			out_size = get_op_size(rex, oso);
+			out_length += get_modRM_size(code);
+			return;
+		}
+		break;
+	}
+	case 0xa4:
+	{
+		if (!oso && !lock && !repe && !rex) // MOVS
+		{
+			out_op = X64OP_MOVS;
+			out_reg = X64_NOT_SET;
+			out_size = 1;
+			return;
+		}
+		if (!oso && !lock && repe) // REP MOVS
+		{
+			out_op = X64OP_MOVS;
+			out_reg = rex & 8 ? X64R_RCX : X64R_ECX;
+			out_size = 1;
+			return;
+		}
+		break;
+	}
+	case 0xaa:
+	{
+		if (!oso && !lock && !repe && !rex) // STOS
+		{
+			out_op = X64OP_STOS;
+			out_reg = X64_NOT_SET;
+			out_size = 1;
+			return;
+		}
+		if (!oso && !lock && repe) // REP STOS
+		{
+			out_op = X64OP_STOS;
+			out_reg = rex & 8 ? X64R_RCX : X64R_ECX;
+			out_size = 1;
+			return;
+		}
+		break;
+	}
+	case 0xc4: // 3-byte VEX prefix
+	case 0xc5: // 2-byte VEX prefix
+	{
+		// Last prefix byte: op2 or op3
+		const u8 opx = op1 == 0xc5 ? op2 : op3;
+
+		// Implied prefixes
+		rex |= op2 & 0x80 ? 0 : 0x4; // REX.R
+		rex |= op1 == 0xc4 && op3 & 0x80 ? 0x8 : 0; // REX.W ???
+		oso = (opx & 0x3) == 0x1;
+		repe = (opx & 0x3) == 0x2;
+		repne = (opx & 0x3) == 0x3;
+
+		const u8 vopm = op1 == 0xc5 ? 1 : op2 & 0x1f;
+		const u8 vop1 = op1 == 0xc5 ? op3 : code[2];
+		const u8 vlen = (opx & 0x4) ? 32 : 16;
+		const u8 vreg = (~opx >> 3) & 0xf;
+		out_length += op1 == 0xc5 ? 2 : 3;
+		code += op1 == 0xc5 ? 2 : 3;
+
+		s_tls_reg3 = x64_reg_t{vreg};
+
+		if (vopm == 0x1) switch (vop1) // Implied leading byte 0x0F
+		{
+		case 0x11:
+		case 0x29:
+		{
+			if (!repe && !repne) // VMOVAPS/VMOVAPD/VMOVUPS/VMOVUPD mem,reg
+			{
+				out_op = X64OP_STORE;
+				out_reg = get_modRM_reg_xmm(code, rex);
+				out_size = vlen;
+				out_length += get_modRM_size(code);
+				return;
+			}
+			break;
+		}
+		case 0x7f:
+		{
+			if (repe || oso) // VMOVDQU/VMOVDQA mem,reg
+			{
+				out_op = X64OP_STORE;
+				out_reg = get_modRM_reg_xmm(code, rex);
+				out_size = vlen;
+				out_length += get_modRM_size(code);
+				return;
+			}
+			break;
+		}
+		}
+
+		if (vopm == 0x2) switch (vop1) // Implied leading bytes 0x0F 0x38
+		{
+		case 0xf7:
+		{
+			if (!repe && !repne && vlen == 16) // BEXTR r32,mem,r32
+			{
+				out_op = X64OP_BEXTR;
+				out_reg = get_modRM_reg_xmm(code, rex);
+				out_size = opx & 0x80 ? 8 : 4;
+				out_length += get_modRM_size(code);
+				return;
+			}
+			break;
+		}
+		}
+
+		break;
+	}
+	case 0xc6:
+	{
+		if (!lock && !oso && get_modRM_reg(code, 0) == 0) // MOV r8/m8, imm8
+		{
+			out_op = X64OP_STORE;
+			out_reg = X64_IMM8;
+			out_size = 1;
+			out_length += get_modRM_size(code) + 1;
+			return;
+		}
+		break;
+	}
+	case 0xc7:
+	{
+		if (!lock && get_modRM_reg(code, 0) == 0) // MOV r/m, imm16/imm32 (16, 32, 64)
+		{
+			out_op = X64OP_STORE;
+			out_reg = oso ? X64_IMM16 : X64_IMM32;
+			out_size = get_op_size(rex, oso);
+			out_length += get_modRM_size(code) + (oso ? 2 : 4);
+			return;
+		}
+		break;
+	}
+	case 0xf6:
+	{
+		switch (get_modRM_reg(code, 0))
+		{
+		case 0: out_op = X64OP_LOAD_TEST; break;
+		default: out_op = X64OP_NONE; break; // TODO...
+		}
+
+		out_reg = X64_IMM8;
+		out_size = 1;
+		out_length += get_modRM_size(code) + 1;
+		return;
+	}
+	case 0xf7:
+	{
+		switch (get_modRM_reg(code, 0))
+		{
+		case 0: out_op = X64OP_LOAD_TEST; break;
+		default: out_op = X64OP_NONE; break; // TODO...
+		}
+
+		out_reg = oso ? X64_IMM16 : X64_IMM32;
+		out_size = get_op_size(rex, oso);
+		out_length += get_modRM_size(code) + (oso ? 2 : 4);
+		return;
+	}
+	}
+
+	out_op = X64OP_NONE;
+	out_reg = X64_NOT_SET;
+	out_size = 0;
+	out_length = 0;
+}
+
+#ifdef _WIN32
+
+typedef CONTEXT x64_context;
+typedef CONTEXT ucontext_t;
+
+#define X64REG(context, reg) (&(&(context)->Rax)[reg])
+#define XMMREG(context, reg) (reinterpret_cast<v128*>(&(&(context)->Xmm0)[reg]))
+#define EFLAGS(context) ((context)->EFlags)
+
+#define ARG1(context) RCX(context)
+#define ARG2(context) RDX(context)
+
+#else
+
+typedef ucontext_t x64_context;
+
+#ifdef __APPLE__
+
+#define X64REG(context, reg) (darwin_x64reg(context, reg))
+#define XMMREG(context, reg) (reinterpret_cast<v128*>(&(context)->uc_mcontext->__fs.__fpu_xmm0.__xmm_reg[reg]))
+#define EFLAGS(context) ((context)->uc_mcontext->__ss.__rflags)
+
+u64* darwin_x64reg(x64_context *context, int reg)
+{
+	auto *state = &context->uc_mcontext->__ss;
+	switch(reg)
+	{
+	case 0: return &state->__rax;
+	case 1: return &state->__rcx;
+	case 2: return &state->__rdx;
+	case 3: return &state->__rbx;
+	case 4: return &state->__rsp;
+	case 5: return &state->__rbp;
+	case 6: return &state->__rsi;
+	case 7: return &state->__rdi;
+	case 8: return &state->__r8;
+	case 9: return &state->__r9;
+	case 10: return &state->__r10;
+	case 11: return &state->__r11;
+	case 12: return &state->__r12;
+	case 13: return &state->__r13;
+	case 14: return &state->__r14;
+	case 15: return &state->__r15;
+	case 16: return &state->__rip;
+	default:
+		sig_log.error("Invalid register index: %d", reg);
+		return nullptr;
+	}
+}
+
+#elif defined(__DragonFly__) || defined(__FreeBSD__)
+
+#define X64REG(context, reg) (freebsd_x64reg(context, reg))
+#ifdef __DragonFly__
+#  define XMMREG(context, reg) (reinterpret_cast<v128*>((reinterpret_cast<union savefpu*>(context)->uc_mcontext.mc_fpregs)->sv_xmm.sv_xmm[reg]))
+#else
+#  define XMMREG(context, reg) (reinterpret_cast<v128*>((reinterpret_cast<struct savefpu*>(context)->uc_mcontext.mc_fpstate)->sv_xmm[reg]))
+#endif
+#define EFLAGS(context) ((context)->uc_mcontext.mc_rflags)
+
+register_t* freebsd_x64reg(x64_context *context, int reg)
+{
+	auto *state = &context->uc_mcontext;
+	switch(reg)
+	{
+	case 0: return &state->mc_rax;
+	case 1: return &state->mc_rcx;
+	case 2: return &state->mc_rdx;
+	case 3: return &state->mc_rbx;
+	case 4: return &state->mc_rsp;
+	case 5: return &state->mc_rbp;
+	case 6: return &state->mc_rsi;
+	case 7: return &state->mc_rdi;
+	case 8: return &state->mc_r8;
+	case 9: return &state->mc_r9;
+	case 10: return &state->mc_r10;
+	case 11: return &state->mc_r11;
+	case 12: return &state->mc_r12;
+	case 13: return &state->mc_r13;
+	case 14: return &state->mc_r14;
+	case 15: return &state->mc_r15;
+	case 16: return &state->mc_rip;
+	default:
+		sig_log.error("Invalid register index: %d", reg);
+		return nullptr;
+	}
+}
+
+#elif defined(__OpenBSD__)
+
+#define X64REG(context, reg) (openbsd_x64reg(context, reg))
+#define XMMREG(context, reg) (reinterpret_cast<v128*>((context)->sc_fpstate->fx_xmm[reg]))
+#define EFLAGS(context) ((context)->sc_rflags)
+
+long* openbsd_x64reg(x64_context *context, int reg)
+{
+	auto *state = &context;
+	switch(reg)
+	{
+	case 0: return &state->sc_rax;
+	case 1: return &state->sc_rcx;
+	case 2: return &state->sc_rdx;
+	case 3: return &state->sc_rbx;
+	case 4: return &state->sc_rsp;
+	case 5: return &state->sc_rbp;
+	case 6: return &state->sc_rsi;
+	case 7: return &state->sc_rdi;
+	case 8: return &state->sc_r8;
+	case 9: return &state->sc_r9;
+	case 10: return &state->sc_r10;
+	case 11: return &state->sc_r11;
+	case 12: return &state->sc_r12;
+	case 13: return &state->sc_r13;
+	case 14: return &state->sc_r14;
+	case 15: return &state->sc_r15;
+	case 16: return &state->sc_rip;
+	default:
+		sig_log.error("Invalid register index: %d", reg);
+		return nullptr;
+	}
+}
+
+#elif defined(__NetBSD__)
+
+static const decltype(_REG_RAX) reg_table[] =
+{
+	_REG_RAX, _REG_RCX, _REG_RDX, _REG_RBX, _REG_RSP, _REG_RBP, _REG_RSI, _REG_RDI,
+	_REG_R8, _REG_R9, _REG_R10, _REG_R11, _REG_R12, _REG_R13, _REG_R14, _REG_R15, _REG_RIP
+};
+
+#define X64REG(context, reg) (&(context)->uc_mcontext.__gregs[reg_table[reg]])
+#define XMM_sig(context, reg) (reinterpret_cast<v128*>(((struct fxsave64*)(context)->uc_mcontext.__fpregs)->fx_xmm[reg]))
+#define EFLAGS(context) ((context)->uc_mcontext.__gregs[_REG_RFL])
+
+#else
+
+static const int reg_table[] =
+{
+	REG_RAX, REG_RCX, REG_RDX, REG_RBX, REG_RSP, REG_RBP, REG_RSI, REG_RDI,
+	REG_R8, REG_R9, REG_R10, REG_R11, REG_R12, REG_R13, REG_R14, REG_R15, REG_RIP
+};
+
+#define X64REG(context, reg) (&(context)->uc_mcontext.gregs[reg_table[reg]])
+#ifdef __sun
+#define XMMREG(context, reg) (reinterpret_cast<v128*>(&(context)->uc_mcontext.fpregs.fp_reg_set.fpchip_state.xmm[reg_table[reg]]))
+#else
+#define XMMREG(context, reg) (reinterpret_cast<v128*>(&(context)->uc_mcontext.fpregs->_xmm[reg]))
+#endif // __sun
+#define EFLAGS(context) ((context)->uc_mcontext.gregs[REG_EFL])
+
+#endif // __APPLE__
+
+#define ARG1(context) RDI(context)
+#define ARG2(context) RSI(context)
+
+#endif
+
+#define RAX(c) (*X64REG((c), 0))
+#define RCX(c) (*X64REG((c), 1))
+#define RDX(c) (*X64REG((c), 2))
+#define RSP(c) (*X64REG((c), 4))
+#define RSI(c) (*X64REG((c), 6))
+#define RDI(c) (*X64REG((c), 7))
+#define RIP(c) (*X64REG((c), 16))
+
+bool get_x64_reg_value(x64_context* context, x64_reg_t reg, usz d_size, usz i_size, u64& out_value)
+{
+	// get x64 reg value (for store operations)
+	if (reg - X64R_RAX < 16)
+	{
+		// load the value from x64 register
+		const u64 reg_value = *X64REG(context, reg - X64R_RAX);
+
+		switch (d_size)
+		{
+		case 1: out_value = static_cast<u8>(reg_value); return true;
+		case 2: out_value = static_cast<u16>(reg_value); return true;
+		case 4: out_value = static_cast<u32>(reg_value); return true;
+		case 8: out_value = reg_value; return true;
+		}
+	}
+	else if (reg - X64R_AL < 4 && d_size == 1)
+	{
+		out_value = static_cast<u8>(*X64REG(context, reg - X64R_AL));
+		return true;
+	}
+	else if (reg - X64R_AH < 4 && d_size == 1)
+	{
+		out_value = static_cast<u8>(*X64REG(context, reg - X64R_AH) >> 8);
+		return true;
+	}
+	else if (reg == X64_IMM8)
+	{
+		// load the immediate value (assuming it's at the end of the instruction)
+		const s8 imm_value = *reinterpret_cast<s8*>(RIP(context) + i_size - 1);
+
+		switch (d_size)
+		{
+		case 1: out_value = static_cast<u8>(imm_value); return true;
+		case 2: out_value = static_cast<u16>(imm_value); return true; // sign-extended
+		case 4: out_value = static_cast<u32>(imm_value); return true; // sign-extended
+		case 8: out_value = static_cast<u64>(imm_value); return true; // sign-extended
+		}
+	}
+	else if (reg == X64_IMM16)
+	{
+		const s16 imm_value = *reinterpret_cast<s16*>(RIP(context) + i_size - 2);
+
+		switch (d_size)
+		{
+		case 2: out_value = static_cast<u16>(imm_value); return true;
+		}
+	}
+	else if (reg == X64_IMM32)
+	{
+		const s32 imm_value = *reinterpret_cast<s32*>(RIP(context) + i_size - 4);
+
+		switch (d_size)
+		{
+		case 4: out_value = static_cast<u32>(imm_value); return true;
+		case 8: out_value = static_cast<u64>(imm_value); return true; // sign-extended
+		}
+	}
+	else if (reg == X64R_ECX)
+	{
+		out_value = static_cast<u32>(RCX(context));
+		return true;
+	}
+	else if (reg >= X64_BIT_O && reg <= X64_BIT_NLE)
+	{
+		const u32 _cf = EFLAGS(context) & 0x1;
+		const u32 _zf = EFLAGS(context) & 0x40;
+		const u32 _sf = EFLAGS(context) & 0x80;
+		const u32 _of = EFLAGS(context) & 0x800;
+		const u32 _pf = EFLAGS(context) & 0x4;
+		const u32 _l = (_sf << 4) ^ _of; // SF != OF
+
+		switch (reg & ~1)
+		{
+		case X64_BIT_O: out_value = !!_of ^ (reg & 1); break;
+		case X64_BIT_C: out_value = !!_cf ^ (reg & 1); break;
+		case X64_BIT_Z: out_value = !!_zf ^ (reg & 1); break;
+		case X64_BIT_BE: out_value = !!(_cf | _zf) ^ (reg & 1); break;
+		case X64_BIT_S: out_value = !!_sf ^ (reg & 1); break;
+		case X64_BIT_P: out_value = !!_pf ^ (reg & 1); break;
+		case X64_BIT_L: out_value = !!_l ^ (reg & 1); break;
+		case X64_BIT_LE: out_value = !!(_l | _zf) ^ (reg & 1); break;
+		}
+
+		return true;
+	}
+
+	sig_log.error("get_x64_reg_value(): invalid arguments (reg=%d, d_size=%lld, i_size=%lld)", +reg, d_size, i_size);
+	return false;
+}
+
+bool put_x64_reg_value(x64_context* context, x64_reg_t reg, usz d_size, u64 value)
+{
+	// save x64 reg value (for load operations)
+	if (reg - X64R_RAX < 16)
+	{
+		// save the value into x64 register
+		switch (d_size)
+		{
+		case 1: *X64REG(context, reg - X64R_RAX) = (value & 0xff) | (*X64REG(context, reg - X64R_RAX) & 0xffffff00); return true;
+		case 2: *X64REG(context, reg - X64R_RAX) = (value & 0xffff) | (*X64REG(context, reg - X64R_RAX) & 0xffff0000); return true;
+		case 4: *X64REG(context, reg - X64R_RAX) = value & 0xffffffff; return true;
+		case 8: *X64REG(context, reg - X64R_RAX) = value; return true;
+		}
+	}
+
+	sig_log.error("put_x64_reg_value(): invalid destination (reg=%d, d_size=%lld, value=0x%llx)", +reg, d_size, value);
+	return false;
+}
+
+bool set_x64_cmp_flags(x64_context* context, usz d_size, u64 x, u64 y, bool carry = true)
+{
+	switch (d_size)
+	{
+	case 1: break;
+	case 2: break;
+	case 4: break;
+	case 8: break;
+	default: sig_log.error("set_x64_cmp_flags(): invalid d_size (%lld)", d_size); return false;
+	}
+
+	const u64 sign = 1ull << (d_size * 8 - 1); // sign mask
+	const u64 diff = x - y;
+	const u64 summ = x + y;
+
+	if (carry && ((x & y) | ((x ^ y) & ~summ)) & sign)
+	{
+		EFLAGS(context) |= 0x1; // set CF
+	}
+	else if (carry)
+	{
+		EFLAGS(context) &= ~0x1; // clear CF
+	}
+
+	if (x == y)
+	{
+		EFLAGS(context) |= 0x40; // set ZF
+	}
+	else
+	{
+		EFLAGS(context) &= ~0x40; // clear ZF
+	}
+
+	if (diff & sign)
+	{
+		EFLAGS(context) |= 0x80; // set SF
+	}
+	else
+	{
+		EFLAGS(context) &= ~0x80; // clear SF
+	}
+
+	if ((x ^ summ) & (y ^ summ) & sign)
+	{
+		EFLAGS(context) |= 0x800; // set OF
+	}
+	else
+	{
+		EFLAGS(context) &= ~0x800; // clear OF
+	}
+
+	const u8 p1 = static_cast<u8>(diff) ^ (static_cast<u8>(diff) >> 4);
+	const u8 p2 = p1 ^ (p1 >> 2);
+	const u8 p3 = p2 ^ (p2 >> 1);
+
+	if ((p3 & 1) == 0)
+	{
+		EFLAGS(context) |= 0x4; // set PF
+	}
+	else
+	{
+		EFLAGS(context) &= ~0x4; // clear PF
+	}
+
+	if (((x & y) | ((x ^ y) & ~summ)) & 0x8)
+	{
+		EFLAGS(context) |= 0x10; // set AF
+	}
+	else
+	{
+		EFLAGS(context) &= ~0x10; // clear AF
+	}
+
+	return true;
+}
+
+usz get_x64_access_size(x64_context* context, x64_op_t op, x64_reg_t reg, usz d_size, usz i_size)
+{
+	if (op == X64OP_MOVS || op == X64OP_STOS)
+	{
+		if (EFLAGS(context) & 0x400 /* direction flag */)
+		{
+			// TODO
+			return 0;
+		}
+
+		if (reg != X64_NOT_SET) // get "full" access size from RCX register
+		{
+			u64 counter = 1;
+			if (!get_x64_reg_value(context, reg, 8, i_size, counter))
+			{
+				return -1;
+			}
+
+			return d_size * counter;
+		}
+	}
+
+	return d_size;
+}
+
+#elif defined(ARCH_ARM64)
+
+#ifdef _WIN32
+#define RIP(context) (reinterpret_cast<CONTEXT*>((context))->Pc)
+#define GPR(context, index) (reinterpret_cast<CONTEXT*>((context))->X[index])
+#elif defined(__APPLE__)
+// https://github.com/bombela/backward-cpp/issues/200
+#define RIP(context) ((context)->uc_mcontext->__ss.__pc)
+#define GPR(context, index) ((context)->uc_mcontext->__ss.__x[(index)])
+#elif defined(__FreeBSD__)
+#define RIP(context) ((context)->uc_mcontext.mc_gpregs.gp_elr)
+#define GPR(context, index) ((context)->uc_mcontext.mc_gpregs.gp_x[(index)])
+#elif defined(__NetBSD__)
+#define RIP(context) ((context)->uc_mcontext.__gregs[_REG_PC])
+#define GPR(context, index) ((context)->uc_mcontext.__gregs[(index)])
+#elif defined(__OpenBSD__)
+#define RIP(context) ((context)->sc_elr)
+#define GPR(context, index) ((context)->sc_x[(index)])
+#else
+#define RIP(context) ((context)->uc_mcontext.pc)
+#define GPR(context, index) ((context)->uc_mcontext.regs[(index)])
+#endif
+
+enum mem_a64_op_t
+{
+	A64_INVALID = 0,
+	A64_LOAD,
+	A64_STORE,
+};
+
+struct a64_mem_info_t
+{
+	mem_a64_op_t op;
+	u32 mem_size;   // Bytes accessed in memory
+	u32 reg_size;   // Register width (4 or 8 bytes)
+	u32 reg_num;
+	bool reg_signed;
+};
+
+a64_mem_info_t decode_a64_mem_inst(u32 inst)
+{
+	a64_mem_info_t r{ A64_INVALID, 0, 0, inst % 32, false };
+
+	// Exclude SIMD/FP loads/stores
+	if ((inst >> 26) & 1)
+	{
+		return r;
+	}
+
+	// Scalar load/store immediate, unsigned offset variants only:
+	// size[31:30]
+	// V[26]
+	// opc[23:22]
+	// class bits[29:24] = 111001
+	if ((inst & 0x3B000000) == 0x39000000)
+	{
+		const u32 size = (inst >> 30) & 3;
+		const u32 opc  = (inst >> 22) & 3;
+
+		r.mem_size = 1u << size;
+
+		switch (opc)
+		{
+		case 0:
+		{
+			// STR
+			r.op = A64_STORE;
+			r.reg_size = r.mem_size;
+			return r;
+		}
+		case 1:
+		{
+			// LDR unsigned zero-extend
+			// size=3 (64-bit) -> Xt; everything else -> Wt
+			r.op = A64_LOAD;
+			r.reg_size = (size == 3) ? 8u : 4u;
+			r.reg_signed = false;
+			return r;
+		}
+		case 2:
+		case 3:
+		{
+			if (size == 3)
+			{
+				return r;
+			}
+
+			if (size == 2 && opc == 3)
+			{
+				// Invalid LDRSW
+				return r;
+			}
+
+			// LDRSB/LDRSH/LDRSW
+			// size determines extension type:
+			// 00 LDRSB
+			// 01 LDRSH
+			// 10 LDRSW
+			r.op = A64_LOAD;
+
+			if (size == 2)
+			{
+				// LDUSW
+				r.reg_size = 8;
+			}
+			else
+			{
+				// LDRSB/LDRSH
+				// opc=2 -> Wt, opc=3 -> Xt
+				r.reg_size = (opc == 3) ? 4 : 8;
+			}
+
+			r.reg_signed = true;
+			return r;
+		}
+		default:
+			return r;
+		}
+	}
+
+	// Scalar load/store unscaled immediate (LDUR/STUR)
+	// size[31:30]
+	// V[26]
+	// opc[23:22]
+	if ((inst & 0x3B200C00u) == 0x38000000u)
+	{
+		const u32 size = (inst >> 30) & 3;
+		const u32 opc  = (inst >> 22) & 3;
+
+		r.mem_size = 1u << size;
+
+		switch (opc)
+		{
+		case 0:
+		{
+			// STURB/STURH/STUR Wt/STUR Xt
+			r.op = A64_STORE;
+
+			// Source register width
+			r.reg_size = r.mem_size;
+			return r;
+		}
+
+		case 1:
+		{
+			// LDURB/LDURH/LDUR Wt/LDUR Xt
+			r.op = A64_LOAD;
+
+			// Destination register width
+			r.reg_size = (size == 3) ? 8 : 4;
+			r.reg_signed = false;
+			return r;
+		}
+
+		case 2:
+		case 3:
+		{
+			// LDURSB/LDURSH/LDURSW
+			if (size == 3)
+			{
+				return r;
+			}
+
+			r.op = A64_LOAD;
+			r.reg_signed = true;
+
+			if (size == 2)
+			{
+				// LDURSW
+				r.reg_size = 8;
+			}
+			else
+			{
+				// LDURSB/LDURSH
+				// opc=2 -> Wt, opc=3 -> Xt
+				r.reg_size = (opc == 3) ? 4 : 8;
+			}
+
+			return r;
+		}
+		default:
+			return r;
+		}
+	}
+
+	// 
+	// Literal loads:
+	// 
+	// LDR Wt, label
+	// LDR Xt, label
+	// LDRSW Xt, label
+	//
+
+	// This is not needed for MMIO (which is the only use for this function)
+
+	// if ((inst & 0x3B000000) == 0x18000000)
+	// {
+	// 	u32 opc = (inst >> 30) & 3;
+
+	// 	r.op = A64_LOAD;
+
+	// 	switch (opc)
+	// 	{
+	// 	case 0: // LDR Wt literal
+	// 	{
+	// 		r.mem_size = 4;
+	// 		r.reg_size = 4;
+	// 		return r;
+	// 	}
+	// 	case 1: // LDR Xt literal
+	// 	{
+	// 		r.mem_size = 8;
+	// 		r.reg_size = 8;
+	// 		return r;
+	// 	}
+	// 	case 2: // LDRSW literal
+	// 	{
+	// 		r.mem_size = 4;
+	// 		r.reg_size = 8;
+	// 		r.reg_signed = true;
+	// 		return r;
+	// 	}
+	// 	default:
+	// 	{
+	// 		break;
+	// 	}
+	// 	}
+	// }
+
+	return r;
+}
+
+void put_a64_reg_value(ucontext_t* context, u32 reg_index, u32 reg_size, bool reg_signed, u32 mem_size, u64 value)
+{
+	ensure(mem_size == 1 || mem_size == 2 || mem_size == 4 || mem_size == 8);
+	ensure(reg_size == 1 || reg_size == 2 || reg_size == 4 || reg_size == 8);
+	ensure(reg_size >= mem_size);
+	ensure(reg_index < 32);
+
+	if (reg_index == 31)
+	{
+		// XZR "register" 
+		ensure(false);
+	}
+
+	auto make_mask = [](u32 bytes) -> u64
+	{
+		if (bytes == 8)
+		{
+			return umax;
+		}
+
+		const u64 bits = bytes * 8;
+		return (u64{1} << bits) - 1;
+	};
+
+	// Mask for sign-extending the value
+	const u64 sign_bit = value & (make_mask(mem_size) / 2 + 1);
+	const u64 sign_mask = (reg_signed && sign_bit != 0 && reg_size > mem_size) ? (make_mask(reg_size) & ~make_mask(mem_size)) : 0;
+
+	u64 temp_reg_value = 0;
+	temp_reg_value |= (value & make_mask(mem_size)); // Set value (adjusted by size)
+	temp_reg_value |= sign_mask; // Apply sign-extension
+	GPR(context, reg_index) = temp_reg_value;
+}
+
+u64 get_a64_reg_value(ucontext_t* context, u32 reg_index, u32 reg_size)
+{
+	ensure(reg_size == 1 || reg_size == 2 || reg_size == 4 || reg_size == 8);
+	ensure(reg_index < 32);
+
+	if (reg_index == 31)
+	{
+		// XZR "register"
+		return 0;
+	}
+
+	auto make_mask = [](u32 bytes) -> u64
+	{
+		if (bytes == 8)
+		{
+			return umax;
+		}
+
+		const u64 bits = bytes * 8;
+		return (u64{1} << bits) - 1;
+	};
+
+	return (GPR(context, reg_index) & make_mask(reg_size));
+}
+
+#endif /* ARCH_ARM64 */
+
+namespace rsx
+{
+	extern std::function<bool(u32 addr, bool is_writing)> g_access_violation_handler;
+}
+
+// The guest code at the fault AND at its callers.
+//
+// Registers and a call stack come free from dump_useful_thread_info(), and for a bad pointer
+// they are only half the answer: they say WHAT the address was, never what computed it. When
+// the faulting function turns out to be something generic, Borderlands 2 faults inside a
+// memcpy handed dest=0x93aef33d and length=0xc3aaf87d, both garbage, the routine itself is
+// blameless and the whole question is which caller filled those arguments.
+//
+// So: a window at cia, then one at each of the first few return addresses. Only a few, because
+// a PPU call stack here runs fourteen frames deep and the answer is almost always in the
+// immediate caller.
+//
+// The window back from cia is wide on purpose. Sixteen instructions is enough to see what
+// faulted and not enough to see the branch that decided to run it, and the guard is what you
+// need when the plan is a patch rather than a diagnosis. Burnout Paradise is the case: the
+// null check has to go in ahead of a store 0x60 bytes behind the reported pc, and the loop
+// bookkeeping that a patch must preserve sits between them.
+//
+// Every address is checked before it is read: cia and the stack are taken from a thread that
+// just faulted, so both can be garbage, and faulting inside the diagnostic that explains a
+// fault would be the worst possible trade.
+//
+// Called from BOTH access violation paths, for the reason given on the memory dump below.
+static void dump_guest_code_at_fault(cpu_thread* cpu, u32 fault_addr, bool is_writing)
+{
+	if (!cpu || cpu->get_class() != thread_class::ppu)
+	{
+		return;
+	}
+
+	const auto& gpr_ref = static_cast<ppu_thread*>(cpu)->gpr;
+	PPUDisAsm dis_asm(cpu_disasm_mode::dump, vm::g_sudo_addr);
+	std::string code;
+
+	// Follow calls, so one fault answers what used to take one run per level.
+	//
+	// A window at cia says what faulted. It never says what the thing it called did, and on
+	// Android there is no debugger to step into it. Burnout Paradise cost six separate crashes
+	// to walk by hand: a PLT stub, a forwarding thunk, a request builder, a descriptor loop, a
+	// lock wrapper, and finally the heap that was refusing the allocation. Every one of those
+	// addresses was only discoverable from the dump before it, so each hop meant another run.
+	//
+	// ARMSX3_DISASM_DEPTH=N disassembles the target of every bl found in a window, N levels
+	// deep, deduplicated and capped. Default 0 is the old behaviour.
+	u32 follow_depth = 0;
+
+	if (const char* depth_env = std::getenv("ARMSX3_DISASM_DEPTH"))
+	{
+		follow_depth = std::min<u32>(static_cast<u32>(std::strtoul(depth_env, nullptr, 0)), 4);
+	}
+
+	std::vector<u32> seen;
+	std::vector<std::pair<u32, u32>> pending;
+
+	const auto window = [&](const char* what, u32 pc, u32 back, u32 span, u32 depth = 0)
+	{
+		fmt::append(code, "\n%s 0x%08x:\n", what, pc);
+
+		for (u32 at = pc >= back ? pc - back : 0; at <= pc + span; at += 4)
+		{
+			if (!vm::check_addr(at))
+			{
+				continue;
+			}
+
+			dis_asm.disasm(at);
+			code += (at == pc ? "  >>" : "    ");
+			code += dis_asm.last_opcode;
+
+			// Name the instruction that actually faulted.
+			//
+			// The >> marker follows cia, and the recompiler reports cia per BLOCK, so on the
+			// fatal path it routinely points at an instruction that cannot have faulted. Burnout
+			// marked `lwz r9,0(r3)` with r3 = 0x86014100 for a fault at address 0, and that gap
+			// is why every dump read like a fresh mystery.
+			//
+			// The dump already holds the fault address and every register, so it can just work
+			// out which memory operand lands on it: D form (rA + simm), DS form (rA + ds*4) and
+			// X form (rA + rB). rA of 0 means literal zero on PowerPC, not r0, which is exactly
+			// the case that produces a small faulting address out of nowhere.
+			{
+				const u32 iop = vm::read32(at);
+				const u32 primary = iop >> 26;
+				const u32 ra = (iop >> 16) & 0x1f;
+				const u64 base = ra ? gpr_ref[ra] : 0;
+
+				bool hit = false;
+
+				// Only instructions that touch memory, and only in the direction that faulted.
+				//
+				// Both filters are load bearing. Primary 31 is not just indexed loads and stores,
+				// it is also every arithmetic and logical form, so matching it wholesale flags an
+				// `add` whose two registers happen to sum to the fault address. With a fault at 0
+				// that is most of the window, and the real access is buried in the noise.
+				const auto store_d = [](u32 op)
+				{
+					return (op >= 36 && op <= 39) || op == 44 || op == 45 || op == 47
+						|| (op >= 52 && op <= 55);
+				};
+
+				if (primary >= 32 && primary <= 55)
+				{
+					hit = store_d(primary) == is_writing
+						&& static_cast<u32>(base + static_cast<s16>(iop & 0xffff)) == fault_addr;
+				}
+				else if (primary == 58 || primary == 62)
+				{
+					hit = (primary == 62) == is_writing
+						&& static_cast<u32>(base + (static_cast<s16>(iop & 0xfffc))) == fault_addr;
+				}
+				else if (primary == 31)
+				{
+					// Indexed memory forms only, by extended opcode.
+					switch ((iop >> 1) & 0x3ff)
+					{
+					case 21: case 23: case 53: case 55: case 87: case 119:
+					case 279: case 311: case 341: case 343: case 373: case 375:
+					case 534: case 535: case 567: case 597: case 599: case 631:
+					{
+						hit = !is_writing;
+						break;
+					}
+					case 149: case 151: case 181: case 183: case 215: case 247:
+					case 407: case 439: case 662: case 663: case 695: case 725:
+					case 727: case 759: case 918:
+					{
+						hit = is_writing;
+						break;
+					}
+					default: { hit = false; break; }
+					}
+
+					hit = hit && static_cast<u32>(base + gpr_ref[(iop >> 11) & 0x1f]) == fault_addr;
+				}
+
+				if (hit)
+				{
+					code.pop_back();
+					fmt::append(code, "   <== THIS ONE: r%u + offset = 0x%x, the faulting address\n", ra, fault_addr);
+				}
+			}
+
+			if (depth >= follow_depth)
+			{
+				continue;
+			}
+
+			// bl: primary opcode 18, AA clear, LK set. Relative, so the target is computed
+			// from the instruction's own address.
+			const u32 op = vm::read32(at);
+
+			if ((op & 0xfc000003) != 0x48000001)
+			{
+				continue;
+			}
+
+			s32 disp = static_cast<s32>(op & 0x03fffffc);
+
+			if (disp & 0x02000000)
+			{
+				disp -= 0x04000000;
+			}
+
+			pending.emplace_back(at + static_cast<u32>(disp), depth + 1);
+		}
+	};
+
+	window("Code at the faulting pc", static_cast<ppu_thread*>(cpu)->cia, 0x100, 0x40);
+
+	u32 shown = 0;
+
+	for (auto&& [ret, sp] : cpu->dump_callstack_list())
+	{
+		if (shown++ >= 3)
+		{
+			break;
+		}
+
+		// Back further than forward: the call is BEHIND the return address, and what fills
+		// the arguments sits behind that.
+		window("Code at caller", ret, 0x60, 0x10);
+	}
+
+	// Drain whatever those windows called, breadth first so the immediate callees land
+	// before anything they in turn call. Capped, because a single window can name a dozen
+	// targets and four levels of that is a log nobody reads.
+	for (usz i = 0; i < pending.size() && seen.size() < 24; i++)
+	{
+		const auto [target, depth] = pending[i];
+
+		if (!vm::check_addr(target, vm::page_executable))
+		{
+			continue;
+		}
+
+		if (std::find(seen.begin(), seen.end(), target) != seen.end())
+		{
+			continue;
+		}
+
+		seen.push_back(target);
+
+		// Short windows: what matters about a callee is how it starts and what it calls,
+		// and the one that actually fails is reached by following those, not by reading
+		// any single one to its end.
+		window("Code at a call target", target, 0, 0x60, depth);
+	}
+
+	// A lever for disassembling somewhere the fault does not reach.
+	//
+	// The windows above follow cia and the call stack. That is the right default, and it cannot
+	// answer a question about a function that has already returned. Burnout Paradise is the case:
+	// the crash is a store through a null audio buffer pointer, the pointer is null because the
+	// guest allocator at 0x14160 returned zero, and by the time anything faults that allocator is
+	// long gone from the stack. Nothing in a fault dump can reach it, and on Android there is no
+	// debugger to go and look.
+	//
+	// Put ARMSX3_DISASM_AT=0x14160 in driver_env.txt and the next fault prints it, with
+	// ARMSX3_DISASM_LEN to say how much. Costs one getenv when unset, which is how it should stay
+	// unless somebody is actually chasing something.
+	if (const char* at_env = std::getenv("ARMSX3_DISASM_AT"))
+	{
+		const u32 at = static_cast<u32>(std::strtoul(at_env, nullptr, 0)) & ~3u;
+
+		u32 len = 0x200;
+
+		if (const char* len_env = std::getenv("ARMSX3_DISASM_LEN"))
+		{
+			if (const u32 parsed = static_cast<u32>(std::strtoul(len_env, nullptr, 0)))
+			{
+				len = std::min<u32>(parsed, 0x2000);
+			}
+		}
+
+		// Said out loud when it is wrong: a silent nothing here is indistinguishable from a
+		// fault that never fired, and the whole point of the lever is that someone is waiting
+		// on its output.
+		if (at && vm::check_addr(at, vm::page_executable))
+		{
+			window("Code at ARMSX3_DISASM_AT", at, 0, len);
+		}
+		else
+		{
+			fmt::append(code, "\nARMSX3_DISASM_AT 0x%08x is not executable guest memory\n", at);
+		}
+	}
+
+	// Follow a pointer chain from a register, and disassemble wherever it lands.
+	//
+	// ARMSX3_DISASM_AT answers "what is at this address". It cannot answer "what does this call
+	// actually reach" when the target is behind a vtable, because that address only exists at
+	// runtime. Burnout Paradise needs exactly that: the audio allocator it calls turns out to be
+	// a forwarding thunk that loads r3->[0x14], then that object's vtable, then a slot in it, and
+	// calls through ctr. Five dereferences, not one of them a fixed address.
+	//
+	// ARMSX3_CHAIN=r31,4,0x14,0,0xc,0 starts at r31 and walks those offsets. Every step is
+	// printed, because a chain that takes a wrong turn still produces a plausible looking number
+	// and silently disassembling whatever it lands on is worse than saying nothing. The end of
+	// the chain is disassembled when it points at executable memory.
+	if (const char* chain_env = std::getenv("ARMSX3_CHAIN"))
+	{
+		const auto& gpr = static_cast<ppu_thread*>(cpu)->gpr;
+
+		std::string spec = chain_env;
+		std::string trace;
+		u32 cur = 0;
+		bool ok = true;
+
+		usz pos = spec.find(',');
+		const std::string first = spec.substr(0, pos);
+
+		if (first.size() > 1 && (first[0] == 'r' || first[0] == 'R'))
+		{
+			if (const u32 idx = static_cast<u32>(std::strtoul(first.c_str() + 1, nullptr, 10)); idx < 32)
+			{
+				cur = static_cast<u32>(gpr[idx]);
+				fmt::append(trace, "\n  %s = 0x%08x", first, cur);
+			}
+			else
+			{
+				fmt::append(trace, "\n  '%s' is not a register", first);
+				ok = false;
+			}
+		}
+		else
+		{
+			cur = static_cast<u32>(std::strtoul(first.c_str(), nullptr, 0));
+			fmt::append(trace, "\n  start = 0x%08x", cur);
+		}
+
+		while (ok && pos != std::string::npos)
+		{
+			const usz next = spec.find(',', pos + 1);
+			const std::string tok = spec.substr(pos + 1, next == std::string::npos ? next : next - pos - 1);
+			pos = next;
+
+			const u32 off = static_cast<u32>(std::strtoul(tok.c_str(), nullptr, 0));
+
+			if (!vm::check_addr(cur + off, vm::page_readable, 4))
+			{
+				fmt::append(trace, "\n  [0x%08x + 0x%x] is not readable, chain stops here", cur, off);
+				ok = false;
+				break;
+			}
+
+			const u32 val = vm::read32(cur + off);
+			fmt::append(trace, "\n  [0x%08x + 0x%x] = 0x%08x", cur, off, val);
+			cur = val;
+		}
+
+		fmt::append(code, "\nARMSX3_CHAIN %s:%s\n", spec, trace);
+
+		if (ok && cur && vm::check_addr(cur, vm::page_executable))
+		{
+			window("Code at the end of ARMSX3_CHAIN", cur, 0, 0x200);
+		}
+		else if (ok)
+		{
+			fmt::append(code, "  end of chain 0x%08x is not executable, not disassembling\n", cur);
+		}
+	}
+
+	// Find every instruction matching a bit pattern, anywhere in guest code.
+	//
+	// Some questions are not "what is at this address" but "who writes this field", and a
+	// fault dump cannot answer that by following anything: the writer already ran, possibly
+	// minutes ago, and is not on the stack. On desktop that is a write watchpoint. On Android
+	// there is none, so the next best thing is that the instruction which does it has a fixed
+	// encoding and can simply be looked for.
+	//
+	// Burnout Paradise is the case. One field of an otherwise intact audio structure,
+	// r31+0x17c, holds 0x6387194f where a buffer size belongs, so the game asks the heap for
+	// 1.67GB, the allocation fails, and every pointer that should have come from it stays
+	// null. Every crash after that is downstream of the one bad word, and the only thing left
+	// to learn is who put it there. `stw rX,0x17c(rY)` is 0x9000017c under mask 0xfc00ffff.
+	//
+	// ARMSX3_SCAN=<value>/<mask>, both hex. Pages are checked before they are read and
+	// unmapped ones skipped, so the default range can be generous without caring what is
+	// actually mapped. ARMSX3_SCAN_FROM and ARMSX3_SCAN_TO narrow it.
+	if (const char* scan_env = std::getenv("ARMSX3_SCAN"))
+	{
+		const u32 want = static_cast<u32>(std::strtoul(scan_env, nullptr, 16));
+		const char* slash = std::strchr(scan_env, '/');
+		const u32 mask = slash ? static_cast<u32>(std::strtoul(slash + 1, nullptr, 16)) : 0xffffffffu;
+
+		u32 from = 0x10000;
+		u32 to = 0x10000000;
+
+		if (const char* e = std::getenv("ARMSX3_SCAN_FROM")) from = static_cast<u32>(std::strtoul(e, nullptr, 0)) & ~3u;
+		if (const char* e = std::getenv("ARMSX3_SCAN_TO")) to = static_cast<u32>(std::strtoul(e, nullptr, 0)) & ~3u;
+
+		std::string found;
+		u32 hits = 0;
+
+		for (u32 page = from & ~0xfffu; page < to && hits < 64; page += 0x1000)
+		{
+			if (!vm::check_addr(page, vm::page_executable, 0x1000))
+			{
+				continue;
+			}
+
+			for (u32 at = std::max(page, from); at < page + 0x1000 && at < to && hits < 64; at += 4)
+			{
+				if ((vm::read32(at) & mask) != want)
+				{
+					continue;
+				}
+
+				hits++;
+				dis_asm.disasm(at);
+				found += "    ";
+				found += dis_asm.last_opcode;
+			}
+		}
+
+		fmt::append(code, "\nARMSX3_SCAN %08x/%08x over 0x%08x..0x%08x, %u %s:\n%s",
+			want, mask, from, to, hits, hits == 64 ? "matches (CAPPED)" : "matches", found);
+	}
+
+	vm_log.always()("Guest code around the fault:%s", code);
+}
+
+// The memory the guest registers point AT, not only the values they hold.
+//
+// A null pointer fault names the register that was zero and stops there. What decides the
+// bug is the structure around it. Burnout Paradise (BLUS30061) faults storing through
+// entry->[0x10] of an audio voice table at index 6, with the table base live in r28, and
+// the whole question is whether that voice was never set up or was torn down while the
+// count still included it. The neighbouring entries answer it immediately: every other
+// pointer valid means something cleared exactly one of them, a tail of zeroes means the
+// table was never filled that far. That table is live in guest memory at the moment of the
+// fault and was being thrown away.
+//
+// On desktop a write watchpoint answers this in one run. On Android there is no debugger to
+// attach, which is the same reason the register dump had to be raised to error, so the fault
+// handler is the only place this state can be read at all.
+//
+// Called from BOTH access violation paths. They are easy to confuse: the recoverable one
+// prefixes the thread name and the fatal one does not, and a diagnostic added to only the
+// first is silent for every fault that takes the second.
+//
+// One window per distinct base, so a table address held in three registers prints once, and
+// capped so the answer is not buried in hex. Every window is bounds checked over its full
+// span before any of it is read, because half of a faulted thread's registers are garbage
+// and faulting inside the diagnostic that explains a fault helps nobody.
+static void dump_guest_memory_at_registers(cpu_thread* cpu)
+{
+	if (!cpu || cpu->get_class() != thread_class::ppu)
+	{
+		return;
+	}
+
+	constexpr u32 span = 0x200;
+	constexpr u32 max_windows = 8;
+
+	// Order matters, because the cap bites on every real fault.
+	//
+	// r1, r2 and r13 are the stack, TOC and TLS pointers. They are always valid, so they win
+	// every race to fill a slot, and they are almost never the answer. Burnout Paradise is the
+	// case: r1, r2, r5, r6, r9 and r13 took all six slots and r28, the base of the audio voice
+	// table the fault is about, never got one. The callee saved registers are where a compiler
+	// parks the object a function is working on, so walk those first and leave the pointers
+	// every frame happens to hold until last.
+	static constexpr u8 order[] =
+	{
+		31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20, 19, 18, 17, 16, 15, 14,
+		3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+		1, 2, 13, 0,
+	};
+
+	const auto& gpr = static_cast<ppu_thread*>(cpu)->gpr;
+
+	std::string data;
+	u32 bases[max_windows]{};
+	u32 windows = 0;
+
+	for (const u8 i : order)
+	{
+		if (windows >= max_windows)
+		{
+			break;
+		}
+
+		const u32 base = static_cast<u32>(gpr[i]) & ~0xfu;
+
+		// A small value is an integer the game is carrying, not an address. Only the first row
+		// has to be readable to be worth printing: a structure that runs off the end of its
+		// mapping still says what it held up to that point, and requiring the whole span would
+		// drop exactly the windows near a boundary that tend to matter.
+		if (base < 0x10000 || !vm::check_addr(base, vm::page_readable, 0x10))
+		{
+			continue;
+		}
+
+		bool dup = false;
+
+		for (u32 j = 0; j < windows; j++)
+		{
+			dup |= bases[j] == base;
+		}
+
+		if (dup)
+		{
+			continue;
+		}
+
+		bases[windows++] = base;
+
+		fmt::append(data, "\nr%u -> 0x%08x:\n", i, base);
+
+		for (u32 row = 0; row < span; row += 0x10)
+		{
+			if (!vm::check_addr(base + row, vm::page_readable, 0x10))
+			{
+				break;
+			}
+
+			fmt::append(data, "  %08x:", base + row);
+
+			for (u32 off = 0; off < 0x10; off += 4)
+			{
+				fmt::append(data, " %08x", vm::read32(base + row + off));
+			}
+
+			data += '\n';
+		}
+	}
+
+	if (windows)
+	{
+		vm_log.always()("Guest memory at the register values:%s", data);
+	}
+}
+
+bool handle_access_violation(u32 addr, bool is_writing, bool is_exec, ucontext_t* context) noexcept
+{
+	g_tls_fault_all++;
+
+	const auto cpu = get_current_cpu_thread();
+
+	struct spu_unsavable
+	{
+		spu_thread* _spu;
+
+		spu_unsavable(cpu_thread* cpu) noexcept
+			: _spu(cpu ? cpu->try_get<spu_thread>() : nullptr)
+		{
+			if (_spu)
+			{
+				if (_spu->unsavable)
+				{
+					_spu = nullptr;
+				}
+				else
+				{
+					// Must not be saved inside access violation handler because it is unpredictable
+					_spu->unsavable = true;
+				}
+			}
+		}
+
+		~spu_unsavable() noexcept
+		{
+			if (_spu)
+			{
+				_spu->unsavable = false;
+			}
+		}
+	} spu_protection{cpu};
+
+	if (!is_exec && addr < RAW_SPU_BASE_ADDR && vm::check_addr(addr) && rsx::g_access_violation_handler)
+	{
+		bool state_changed = false;
+
+		if (cpu)
+		{
+			state_changed = vm::temporary_unlock(*cpu);
+		}
+
+		bool handled = rsx::g_access_violation_handler(addr, is_writing);
+
+		if (state_changed && (cpu->state += cpu_flag::temp, cpu->test_stopped()))
+		{
+			//
+		}
+
+		if (handled)
+		{
+			g_tls_fault_rsx++;
+			return true;
+		}
+	}
+
+#if defined(ARCH_X64)
+	const u8* const code = reinterpret_cast<u8*>(RIP(context));
+
+	x64_op_t op;
+	x64_reg_t reg;
+	usz d_size;
+	usz i_size;
+
+	// decode single x64 instruction that causes memory access
+	decode_x64_reg_op(code, op, reg, d_size, i_size);
+
+	auto report_opcode = [=]()
+	{
+		if (op == X64OP_NONE)
+		{
+			be_t<v128> dump;
+			std::memcpy(&dump, code, sizeof(dump));
+			sig_log.error("decode_x64_reg_op(%p): unsupported opcode: %s", code, dump);
+		}
+	};
+
+	if (0x1'0000'0000ull - addr < d_size)
+	{
+		sig_log.error("Invalid d_size (0x%llx)", d_size);
+		report_opcode();
+		return false;
+	}
+
+	// get length of data being accessed
+	usz a_size = get_x64_access_size(context, op, reg, d_size, i_size);
+
+	if (0x1'0000'0000ull - addr < a_size)
+	{
+		sig_log.error("Invalid a_size (0x%llx)", a_size);
+		report_opcode();
+		return false;
+	}
+
+	// check if address is RawSPU MMIO register
+	do if (addr - RAW_SPU_BASE_ADDR < (6 * RAW_SPU_OFFSET) && (addr % RAW_SPU_OFFSET) >= RAW_SPU_PROB_OFFSET)
+	{
+		auto thread = idm::get_unlocked<named_thread<spu_thread>>(spu_thread::find_raw_spu((addr - RAW_SPU_BASE_ADDR) / RAW_SPU_OFFSET));
+
+		if (!thread || is_exec)
+		{
+			break;
+		}
+
+		if (!a_size || !d_size || !i_size)
+		{
+			sig_log.error("Invalid or unsupported instruction (op=%d, reg=%d, d_size=%lld, a_size=0x%llx, i_size=%lld)", +op, +reg, d_size, a_size, i_size);
+			report_opcode();
+			return false;
+		}
+
+		bool handled = true;
+
+		switch (op)
+		{
+		case X64OP_LOAD:
+		case X64OP_LOAD_BE:
+		case X64OP_LOAD_CMP:
+		case X64OP_LOAD_TEST:
+		{
+			u32 value;
+			const u32 addr_aligned = addr & -4;
+
+			if (addr % 4 + a_size > 4)
+			{
+				handled = false;
+				break;
+			}
+
+			if (is_writing || !thread->read_reg(addr_aligned, value))
+			{
+				return false;
+			}
+
+			// Adjust value for 8-bit and 16-bit reads
+			value >>= ((4 - a_size) * 8) - ((addr % 4) * 8);
+			value &= a_size == 4 ? u32{umax} : ((1u << (a_size * 8)) - 1);
+
+			if (op != X64OP_LOAD_BE)
+			{
+				if (a_size == 4)
+				{
+					value = stx::se_storage<u32>::swap(value);
+				}
+				else if (a_size == 2)
+				{
+					value = stx::se_storage<u16>::swap(value);
+				}
+				else
+				{
+					ensure(a_size == 1);
+				}
+			}
+
+			if (op == X64OP_LOAD_CMP)
+			{
+				u64 rvalue;
+				if (!get_x64_reg_value(context, reg, d_size, i_size, rvalue) || !set_x64_cmp_flags(context, d_size, value, rvalue))
+				{
+					return false;
+				}
+
+				break;
+			}
+
+			if (op == X64OP_LOAD_TEST)
+			{
+				u64 rvalue;
+				if (!get_x64_reg_value(context, reg, d_size, i_size, rvalue) || !set_x64_cmp_flags(context, d_size, value & rvalue, 0))
+				{
+					return false;
+				}
+
+				break;
+			}
+
+			if (!put_x64_reg_value(context, reg, d_size, value))
+			{
+				return false;
+			}
+
+			break;
+		}
+		case X64OP_BEXTR:
+		{
+			u32 value;
+			const u32 addr_aligned = addr & -4;
+
+			if (addr % 4 + a_size > 4)
+			{
+				handled = false;
+				break;
+			}
+
+			if (is_writing || !thread->read_reg(addr_aligned, value))
+			{
+				return false;
+			}
+
+			// Adjust value for 8-bit and 16-bit reads
+			value >>= ((4 - a_size) * 8) - ((addr % 4) * 8);
+			value &= a_size == 4 ? u32{umax} : ((1u << (a_size * 8)) - 1);
+
+			if (a_size == 4)
+			{
+				value = std::bit_cast<be_t<u32>>(value);
+			}
+			else if (a_size == 2)
+			{
+				value = std::bit_cast<be_t<u16>>(static_cast<u16>(value));
+			}
+			else
+			{
+				ensure(a_size == 1);
+			}
+
+			u64 ctrl;
+			if (!get_x64_reg_value(context, s_tls_reg3, d_size, i_size, ctrl))
+			{
+				return false;
+			}
+
+			u8 start = ctrl & 0xff;
+			u8 _len = (ctrl & 0xff00) >> 8;
+			if (_len > 32)
+				_len = 32;
+			if (start > 32)
+				start = 32;
+			value = (u64{value} >> start) & ~(u64{umax} << _len);
+
+			if (!put_x64_reg_value(context, reg, d_size, value) || !set_x64_cmp_flags(context, d_size, value, 0))
+			{
+				return false;
+			}
+
+			break;
+		}
+		case X64OP_STORE:
+		case X64OP_STORE_BE:
+		{
+			if (a_size != 4)
+			{
+				// Might be unimplemented, such as writing MFC proxy EAL+EAH using 64-bit store
+				handled = false;
+				break;
+			}
+
+			u64 reg_value;
+			if (!is_writing || !get_x64_reg_value(context, reg, d_size, i_size, reg_value))
+			{
+				return false;
+			}
+
+			u32 val32 = static_cast<u32>(reg_value);
+			if (!thread->write_reg(addr, op == X64OP_STORE ? stx::se_storage<u32>::swap(val32) : val32))
+			{
+				return false;
+			}
+
+			break;
+		}
+		case X64OP_MOVS: // possibly, TODO
+		case X64OP_STOS:
+		default:
+		{
+			sig_log.error("Invalid or unsupported operation (op=%d, addr=0x%x, reg=%d, d_size=%lld, i_size=%lld, a_size=%d)", +op, addr, +reg, d_size, i_size, a_size);
+			report_opcode();
+			return false;
+		}
+		}
+
+		if (!handled)
+		{
+			sig_log.error("Invalid or unsupported operation (op=%d, addr=0x%x, reg=%d, d_size=%lld, i_size=%lld, a_size=%d)", +op, addr, +reg, d_size, i_size, a_size);
+			report_opcode();
+			break;
+		}
+
+		// skip processed instruction
+		RIP(context) += i_size;
+		g_tls_fault_spu++;
+		return true;
+	} while (0);
+#elif defined(ARCH_ARM64)
+	const u8* const code = reinterpret_cast<u8*>(RIP(context));
+
+	const u32 instruction = read_from_ptr_unsafe<u32>(code);
+
+	const auto [op, mem_size, reg_size, reg_index, reg_signed] = decode_a64_mem_inst(instruction);
+
+	auto report_opcode = [&]()
+	{
+		sig_log.error("decode_a64_mem_inst(%p): unsupported opcode: %s", code, +std::bit_cast<be_t<u32>>(instruction));
+	};
+
+	if (0x1'0000'0000ull - addr < mem_size)
+	{
+		sig_log.error("Invalid mem_size (0x%llx)", mem_size);
+		report_opcode();
+		return false;
+	}
+
+	// check if address is RawSPU MMIO register
+	do if (addr - RAW_SPU_BASE_ADDR < (6 * RAW_SPU_OFFSET) && (addr % RAW_SPU_OFFSET) >= RAW_SPU_PROB_OFFSET)
+	{
+		auto thread = idm::get_unlocked<named_thread<spu_thread>>(spu_thread::find_raw_spu((addr - RAW_SPU_BASE_ADDR) / RAW_SPU_OFFSET));
+
+		if (!thread || is_exec)
+		{
+			break;
+		}
+
+		if (!mem_size)
+		{
+			sig_log.error("Invalid or unsupported instruction (reg=%d, mem_size=%lld, reg_size=0x%llx)", reg_index, mem_size, reg_size);
+			report_opcode();
+			return false;
+		}
+
+		bool handled = true;
+
+		switch (op)
+		{
+		case A64_LOAD:
+		{
+			u32 value;
+			const u32 addr_aligned = addr & -4;
+
+			if (addr % 4 + mem_size > 4)
+			{
+				handled = false;
+				break;
+			}
+
+			if (is_writing || !thread->read_reg(addr_aligned, value))
+			{
+				return false;
+			}
+
+			// Adjust value for 8-bit and 16-bit reads
+			value >>= ((4 - mem_size) * 8) - ((addr % 4) * 8);
+			value &= mem_size == 4 ? u32{umax} : ((1u << (mem_size * 8)) - 1);
+
+			if (mem_size == 4)
+			{
+				value = std::bit_cast<be_t<u32>>(value);
+			}
+			else if (mem_size == 2)
+			{
+				value = std::bit_cast<be_t<u16>>(static_cast<u16>(value));
+			}
+			else
+			{
+				ensure(mem_size == 1);
+			}
+
+			// Update register value
+			put_a64_reg_value(context, reg_index, reg_size, reg_signed, mem_size, value);
+			break;
+		}
+		case A64_STORE:
+		{
+			if (mem_size != 4)
+			{
+				// Might be unimplemented, such as writing MFC proxy EAL+EAH using 64-bit store
+				handled = false;
+				break;
+			}
+
+			if (!is_writing)
+			{
+				return false;
+			}
+
+			const u64 reg_value = get_a64_reg_value(context, reg_index, reg_size);
+			const u32 val32 = static_cast<u32>(reg_value);
+			if (!thread->write_reg(addr, std::bit_cast<be_t<u32>>(val32)))
+			{
+				return false;
+			}
+
+			break;
+		}
+		default:
+		{
+			sig_log.error("Invalid or unsupported operation (reg=%d, mem_size=%lld, reg_size=0x%llx)", reg_index, mem_size, reg_size);
+			report_opcode();
+			return false;
+		}
+		}
+
+		if (!handled)
+		{
+			sig_log.error("Invalid or unsupported operation (reg=%d, mem_size=%lld, reg_size=0x%llx)", reg_index, mem_size, reg_size);
+			report_opcode();
+			break;
+		}
+
+		// skip processed instruction
+		RIP(context) = reinterpret_cast<std::remove_cvref_t<decltype(RIP(context))>>(reinterpret_cast<const char*>(RIP(context)) + 4);
+		g_tls_fault_spu++;
+		return true;
+	} while (0);
+#endif /* ARCH_ */
+
+	const auto required_page_perms = (is_writing ? vm::page_writable : vm::page_readable) + (is_exec ? vm::page_executable : 0);
+
+	if (vm::check_addr(addr, required_page_perms))
+	{
+		return true;
+	}
+
+	// Hack: allocate memory in case the emulator is stopping
+	const auto hack_alloc = [&]()
+	{
+		const bool added_flag = cpu && !cpu->state.test_and_set(cpu_flag::wait);
+
+		if (vm::check_addr(addr, required_page_perms))
+		{
+			if (added_flag)
+			{
+				cpu->check_state();
+			}
+
+			return true;
+		}
+
+		const auto area = vm::reserve_map(vm::any, addr & -0x10000, 0x10000);
+
+		if (!area)
+		{
+			if (added_flag)
+			{
+				cpu->check_state();
+			}
+
+			return false;
+		}
+
+		extern void ppu_register_range(u32 addr, u32 size);
+
+		bool reprotected = false;
+
+		if (vm::writer_lock mlock; area->flags & vm::preallocated || vm::check_addr(addr, 0))
+		{
+			// For allocated memory with protection lower than required (such as protection::no or read-only while writing to it)
+			utils::memory_protect(vm::base(addr & -0x1000), 0x1000, utils::protection::rw);
+			reprotected = true;
+		}
+
+		if (reprotected)
+		{
+			if (is_exec && !vm::check_addr(addr, vm::page_executable))
+			{
+				ppu_register_range(addr & -0x10000, 0x10000);
+			}
+			
+			if (added_flag)
+			{
+				cpu->check_state();
+			}
+
+			g_tls_access_violation_recovered = addr;
+			return true;
+		}
+
+		const bool allocated = area->falloc(addr & -0x10000, 0x10000);
+
+		if (allocated)
+		{
+			if (is_exec && !vm::check_addr(addr, vm::page_executable))
+			{
+				ppu_register_range(addr & -0x10000, 0x10000);
+			}
+
+			if (added_flag)
+			{
+				cpu->check_state();
+			}
+
+			g_tls_access_violation_recovered = addr;
+			return true;
+		}
+
+		if (added_flag)
+		{
+			cpu->check_state();
+		}
+	
+		return false;
+	};
+
+	if (cpu && (cpu->get_class() == thread_class::ppu || cpu->get_class() == thread_class::spu) && !is_exec)
+	{
+		vm::temporary_unlock(*cpu);
+		u32 pf_port_id = 0;
+
+		if (auto& pf_entries = g_fxo->get<page_fault_notification_entries>(); true)
+		{
+			if (auto mem = vm::get(vm::any, addr))
+			{
+				reader_lock lock(pf_entries.mutex);
+
+				for (const auto& entry : pf_entries.entries)
+				{
+					if (entry.start_addr == mem->addr)
+					{
+						pf_port_id = entry.port_id;
+						break;
+					}
+				}
+			}
+		}
+
+		if (auto pf_port = idm::get_unlocked<lv2_obj, lv2_event_port>(pf_port_id); pf_port && pf_port->queue)
+		{
+			// We notify the game that a page fault occurred so it can rectify it.
+			// Note, for data3, were the memory readable AND we got a page fault, it must be due to a write violation since reads are allowed.
+			u64 data1 = addr;
+			u64 data2 = 0;
+
+			if (cpu->try_get<ppu_thread>())
+			{
+				data2 = (SYS_MEMORY_PAGE_FAULT_TYPE_PPU_THREAD << 32) | cpu->id;
+			}
+			else if (auto spu = cpu->try_get<spu_thread>())
+			{
+				const u64 type = spu->get_type() == spu_type::threaded ?
+					SYS_MEMORY_PAGE_FAULT_TYPE_SPU_THREAD :
+					SYS_MEMORY_PAGE_FAULT_TYPE_RAW_SPU;
+
+				data2 = (type << 32) | spu->lv2_id;
+			}
+
+			u64 data3;
+			{
+				vm::writer_lock rlock;
+				if (vm::check_addr(addr, is_writing ? vm::page_writable : vm::page_readable))
+				{
+					// Memory was allocated inbetween, retry
+					return true;
+				}
+				else if (vm::check_addr(addr))
+				{
+					data3 = SYS_MEMORY_PAGE_FAULT_CAUSE_READ_ONLY; // TODO
+				}
+				else
+				{
+					data3 = SYS_MEMORY_PAGE_FAULT_CAUSE_NON_MAPPED;
+				}
+			}
+
+
+			// Now, place the page fault event onto table so that other functions [sys_mmapper_free_address and pagefault recovery funcs etc]
+			// know that this thread is page faulted and where.
+
+			auto& pf_events = g_fxo->get<page_fault_event_entries>();
+
+			// De-schedule
+			if (cpu->get_class() == thread_class::ppu)
+			{
+				cpu->state -= cpu_flag::signal; // Cannot use check_state here and signal must be removed if exists
+				lv2_obj::sleep(*cpu);
+			}
+
+			auto send_event = [&]() -> error_code
+			{
+				lv2_obj::notify_all_t notify_later{};
+
+				std::lock_guard pf_lock(pf_events.pf_mutex);
+
+				if (auto error = pf_port->queue->send(pf_port->name ? pf_port->name : ((u64{process_getpid() + 0u} << 32) | u64{pf_port_id}), data1, data2, data3))
+				{
+					return error;
+				}
+
+				pf_events.events.emplace(cpu, addr);
+				return {};
+			};
+
+			sig_log.warning("Page_fault %s location 0x%x because of %s memory", is_writing ? "writing" : "reading",
+				addr, data3 == SYS_MEMORY_PAGE_FAULT_CAUSE_READ_ONLY ? "writing read-only" : "using unmapped");
+
+			if (cpu->get_class() == thread_class::ppu)
+			{
+				if (const auto func = static_cast<ppu_thread*>(cpu)->current_function)
+				{
+					sig_log.warning("Page_fault while in function %s", func);
+				}
+			}
+
+			error_code sending_error = not_an_error(CELL_EBUSY);
+
+			// If we fail due to being busy, wait a bit and try again.
+			for (u64 sleep_until = get_system_time(); static_cast<u32>(sending_error) == CELL_EBUSY; thread_ctrl::wait_until(&sleep_until, 1000))
+			{
+				sending_error = send_event();
+
+				if (cpu->is_stopped())
+				{
+					sending_error = {};
+					break;
+				}
+			}
+
+			if (sending_error)
+			{
+				vm_log.error("Unknown error 0x%x while trying to pass page fault.", +sending_error);
+				return false;
+			}
+			else
+			{
+				// Wait until the thread is recovered
+				while (auto state = cpu->state.fetch_sub(cpu_flag::signal))
+				{
+					if (is_stopped(state) || state & cpu_flag::signal)
+					{
+						break;
+					}
+
+					thread_ctrl::wait_on(cpu->state, state);
+				}
+			}
+
+			// Reschedule, test cpu state and try recovery if stopped
+			if (cpu->test_stopped() && !hack_alloc())
+			{
+				return false;
+			}
+
+			return true;
+		}
+
+		if (cpu->get_class() == thread_class::spu)
+		{
+			if (g_tls_access_violation_recovered != addr)
+			{
+				// error, not notice: Android's logcat sink drops anything below warning, so
+				// this dump -- the guest registers and callstack, the only thing that says
+				// WHICH pointer was null and what the game was holding -- was built on every
+				// fault and then discarded on the one platform that cannot attach a debugger
+				// to read it another way. The fault line beside it is fatal and survives, so
+				// every Android guest crash report has arrived with the answer stripped out.
+				vm_log.error("\n%s", dump_useful_thread_info());
+
+				// Name a guest halt for what it is.
+				//
+				// The SPU recompilers implement the HALT family (HGT/HEQ/HLGT and friends) by
+				// storing to 0xffdead00 on purpose, so the fault handler catches it -- see
+				// make_halt in SPULLVMRecompiler.cpp and its ASMJIT counterpart. Reported as a
+				// bare access violation it reads like an emulator crash at a nonsense address,
+				// and it is neither: those instructions are assertions the GAME compiled into
+				// its own SPU code, so reaching one means the program checked its state, found
+				// it wrong, and stopped itself. The interesting question is what fed it bad
+				// data, which is a completely different investigation from a stray pointer.
+				//
+				// The interpreter already says "Halt" here; only the recompiled path was
+				// silent about it. Hit on Eternal Sonata (BLJS10017), whose TCX_CellSpursKernel0
+				// halts and takes the game's forward progress with it.
+				if (addr >= 0xffdead00 && addr < 0xffdeae00)
+				{
+					vm_log.always()("[%s] SPU halted itself: the guest executed a HALT instruction"
+						" (trap store to 0x%x). This is the game's own assertion firing, not a bad"
+						" pointer -- something upstream handed it state it rejected.",
+						cpu->get_name(), addr);
+				}
+				else
+				{
+					vm_log.always()("[%s] Access violation %s location 0x%x (%s)", cpu->get_name(), is_writing ? "writing" : "reading", addr, (is_writing && vm::check_addr(addr)) ? "read-only memory" : "unmapped memory");
+
+					// The guest code at the fault AND at its callers.
+					//
+					// Registers and a call stack come free from dump_useful_thread_info() above,
+					// and for a bad pointer they are only half the answer: they say WHAT the
+					// address was, never what computed it. When the faulting function turns out to
+					// be something generic -- Borderlands 2 faults inside a memcpy, handed
+					// dest=0x93aef33d and length=0xc3aaf87d, both garbage -- the routine itself is
+					// blameless and the whole question is which caller filled those arguments.
+					//
+					// So: a window at cia, then one at each of the first few return addresses. Only
+					// a few, because a PPU call stack here runs fourteen frames deep and the answer
+					// is almost always in the immediate caller.
+					//
+					// Every address is checked before it is read: cia and the stack are taken from
+					// a thread that just faulted, so both can be garbage, and faulting inside the
+					// diagnostic that explains a fault would be the worst possible trade.
+					dump_guest_code_at_fault(cpu, addr, is_writing);
+					dump_guest_memory_at_registers(cpu);
+				}
+			}
+
+			// TODO:
+			// RawSPU: Send appropriate interrupt
+			// SPUThread: Send sys_spu exception event
+			cpu->state += cpu_flag::dbg_pause;
+
+			if (cpu->check_state() && !hack_alloc())
+			{
+				return false;
+			}
+
+			return true;
+		}
+		else
+		{
+			if (auto last_func = static_cast<ppu_thread*>(cpu)->current_function)
+			{
+				ppu_log.fatal("Function aborted: %s", last_func);
+			}
+
+			lv2_obj::sleep(*cpu);
+		}
+	}
+
+	if (cpu)
+	{
+		cpu->state += cpu_flag::wait;
+	}
+
+	// Note: a thread may access violate more than once after hack_alloc recovery
+	// Do not log any further access violations in this case.
+	if (g_tls_access_violation_recovered != addr)
+	{
+		// error, not notice -- see the SPU path above. Dropped by the logcat cutoff otherwise.
+		vm_log.error("\n%s", dump_useful_thread_info());
+		vm_log.fatal("Access violation %s location 0x%x (%s)", is_writing ? "writing" : (is_exec ? "executing" : "reading"), addr, (is_writing && vm::check_addr(addr)) ? "read-only memory" : "unmapped memory");
+
+		dump_guest_code_at_fault(cpu, addr, is_writing);
+		dump_guest_memory_at_registers(cpu);
+
+		// The host stack, which is the half that was missing.
+		//
+		// dump_useful_thread_info prints GUEST state, and for a fault taken on an emulator
+		// thread rather than inside guest code that says where the emulator was in the game,
+		// not which of our functions dereferenced null. Nor is there a tombstone to fall back
+		// on: this path freezes the emulator instead of aborting, so the process survives and
+		// Android never writes one.
+		//
+		// Yakuza Dead Souls reads location 0xc on the RSX thread with the FIFO empty and
+		// parked at a self-jump -- so the fault is in whatever runs while no commands are
+		// pending, and there are several candidates. Naming the frame settles it.
+		if (const auto stack = utils::get_backtrace_symbols(utils::get_backtrace(32)); !stack.empty())
+		{
+			std::string out;
+
+			for (usz i = 0; i < stack.size(); i++)
+			{
+				fmt::append(out, "\n  #%02u %s", i, stack[i]);
+			}
+
+			vm_log.fatal("Host backtrace:%s", out);
+		}
+	}
+
+	while (Emu.IsPausedOrReady())
+	{
+		if (cpu)
+		{
+			auto state = +cpu->state;
+
+			if (::is_paused(state) && !::is_stopped(state))
+			{
+				thread_ctrl::wait_on(cpu->state, state);
+			}
+			else
+			{
+				// Temporary until Emulator updates state
+				std::this_thread::yield();
+			}
+		}
+		else
+		{
+			thread_ctrl::wait_for(1000);
+		}
+	}
+
+	Emu.Pause(true);
+
+	while (Emu.IsPaused())
+	{
+		if (cpu)
+		{
+			auto state = +cpu->state;
+
+			if (::is_paused(state) && !::is_stopped(state))
+			{
+				thread_ctrl::wait_on(cpu->state, state);
+			}
+			else
+			{
+				// Temporary until Emulator updates state
+				std::this_thread::yield();
+			}
+		}
+		else
+		{
+			thread_ctrl::wait_for(1000);
+		}
+	}
+
+	if (Emu.IsStopped())
+	{
+		// Keep retrying until the page is mapped: the thread must be able to resume so it can observe cpu_flag::exit and terminate cleanly.
+		// Reporting the violation as unhandled here would escalate a guest crash into an unhandled host exception.
+		while (!hack_alloc())
+		{
+			thread_ctrl::wait_for(1000);
+		}
+	}
+
+	return true;
+}
+
+static void append_thread_name(std::string& msg)
+{
+	if (thread_ctrl::get_current())
+	{
+		fmt::append(msg, "Emu Thread Name: '%s'.\n", thread_ctrl::get_name());
+	}
+	else if (thread_ctrl::is_main())
+	{
+		fmt::append(msg, "Thread: Main Thread.\n");
+	}
+	else
+	{
+		fmt::append(msg, "Thread id = %u.\n", thread_ctrl::get_tid());
+	}
+}
+
+#ifdef _WIN32
+
+static LONG exception_handler(PEXCEPTION_POINTERS pExp) noexcept
+{
+	if (pExp->ExceptionRecord->ExceptionCode == EXCEPTION_BREAKPOINT)
+	{
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+
+	const auto ptr = reinterpret_cast<u8*>(pExp->ExceptionRecord->ExceptionInformation[1]);
+	const bool is_writing = pExp->ExceptionRecord->ExceptionInformation[0] == 1;
+	const bool is_executing = pExp->ExceptionRecord->ExceptionInformation[0] == 8;
+
+	if (pExp->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && !is_executing)
+	{
+		u32 addr = 0;
+		bool is_exec = false;
+
+		if (auto [addr0, ok] = vm::try_get_addr(ptr); ok)
+		{
+			addr = addr0;
+		}
+		else if (const usz exec64 = (ptr - vm::g_exec_addr) / 2; exec64 <= u32{umax})
+		{
+			is_exec = true;
+			addr = static_cast<u32>(exec64);
+		}
+		else if (const usz seg_off = (ptr - vm::g_exec_addr - vm::g_exec_addr_seg_offset); seg_off <= u32{umax} / 2)
+		{
+			// Segment map holds one u16 per 4 bytes of guest code: ptr = g_exec_addr + g_exec_addr_seg_offset + (addr >> 1)
+			is_exec = true;
+			addr = static_cast<u32>(seg_off * 2);
+		}
+		else 
+		{
+			std::this_thread::sleep_for(1ms);
+			return EXCEPTION_CONTINUE_SEARCH;
+		}
+
+		if (thread_ctrl::get_current() && handle_access_violation(addr, is_writing, is_exec, pExp->ContextRecord))
+		{
+			return EXCEPTION_CONTINUE_EXECUTION;
+		}
+	}
+
+	switch (pExp->ExceptionRecord->ExceptionCode)
+	{
+	case EXCEPTION_ACCESS_VIOLATION:
+	case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:
+	case EXCEPTION_DATATYPE_MISALIGNMENT:
+	case EXCEPTION_ILLEGAL_INSTRUCTION:
+	case EXCEPTION_IN_PAGE_ERROR:
+	case EXCEPTION_INT_DIVIDE_BY_ZERO:
+	case EXCEPTION_NONCONTINUABLE_EXCEPTION:
+	case EXCEPTION_PRIV_INSTRUCTION:
+	//case EXCEPTION_STACK_OVERFLOW:
+	{
+		sys_log.notice("\n%s", dump_useful_thread_info());
+		logs::listener::sync_all();
+		break;
+	}
+	default:
+	{
+		break;
+	}
+	}
+
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static LONG exception_filter(PEXCEPTION_POINTERS pExp) noexcept
+{
+	std::string msg = fmt::format("Unhandled Win32 exception 0x%08X.\n", pExp->ExceptionRecord->ExceptionCode);
+
+	if (pExp->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION)
+	{
+		const auto cause =
+			pExp->ExceptionRecord->ExceptionInformation[0] == 8 ? "executing" :
+			pExp->ExceptionRecord->ExceptionInformation[0] == 1 ? "writing" : "reading";
+
+		fmt::append(msg, "Segfault %s location %p at %p.\n", cause, pExp->ExceptionRecord->ExceptionInformation[1], pExp->ExceptionRecord->ExceptionAddress);
+
+		if (vm::try_get_addr(reinterpret_cast<u8*>(pExp->ExceptionRecord->ExceptionInformation[1])).second)
+		{
+			fmt::append(msg, "Sudo Addr: %p, VM Addr: %p\n", vm::g_sudo_addr, vm::g_base_addr);
+		}
+	}
+	else
+	{
+		fmt::append(msg, "Exception address: %p.\n", pExp->ExceptionRecord->ExceptionAddress);
+
+		for (DWORD i = 0; i < pExp->ExceptionRecord->NumberParameters; i++)
+		{
+			fmt::append(msg, "ExceptionInformation[0x%x]: %p.\n", i, pExp->ExceptionRecord->ExceptionInformation[i]);
+		}
+	}
+
+	append_thread_name(msg);
+
+	std::vector<HMODULE> modules;
+	for (DWORD size = 256; modules.size() != size; size /= sizeof(HMODULE))
+	{
+		modules.resize(size);
+		if (!EnumProcessModules(GetCurrentProcess(), modules.data(), size * sizeof(HMODULE), &size))
+		{
+			modules.clear();
+			break;
+		}
+	}
+
+#if defined(ARCH_X64)
+	const auto exec_addr = pExp->ContextRecord->Rip;
+#elif defined(ARCH_ARM64)
+	const auto exec_addr = pExp->ContextRecord->Pc;
+#else
+#error "Unimplemented exception handling for this architecture"
+#endif
+
+	fmt::append(msg, "Instruction address: %p.\n", exec_addr);
+
+	DWORD64 unwind_base;
+	if (const auto rtf = RtlLookupFunctionEntry(exec_addr, &unwind_base, nullptr))
+	{
+		// Get function address
+		const DWORD64 func_addr = rtf->BeginAddress + unwind_base;
+		fmt::append(msg, "Function address: %p (base+0x%x).\n", func_addr, rtf->BeginAddress);
+
+		// Access UNWIND_INFO structure
+		//const auto uw = (u8*)(unwind_base + rtf->UnwindData);
+	}
+
+	for (HMODULE _module : modules)
+	{
+		MODULEINFO info;
+		if (GetModuleInformation(GetCurrentProcess(), _module, &info, sizeof(info)))
+		{
+			const DWORD64 base = reinterpret_cast<DWORD64>(info.lpBaseOfDll);
+
+			if (exec_addr >= base && exec_addr < base + info.SizeOfImage)
+			{
+				std::string module_name;
+				for (DWORD size = 15; module_name.size() != size;)
+				{
+					module_name.resize(size);
+					size = GetModuleBaseNameA(GetCurrentProcess(), _module, &module_name.front(), size + 1);
+					if (!size)
+					{
+						module_name.clear();
+						break;
+					}
+				}
+
+				fmt::append(msg, "Module name: '%s'.\n", module_name);
+				fmt::append(msg, "Module base: %p.\n", info.lpBaseOfDll);
+			}
+		}
+	}
+
+	fmt::append(msg, "RPCS3 image base: %p.\n", GetModuleHandle(NULL));
+	
+#if defined(ARCH_X64)
+	fmt::append(msg, "RAX: %016llX	RBX: %016llX\n", pExp->ContextRecord->Rax, pExp->ContextRecord->Rbx);
+	fmt::append(msg, "RCX: %016llX	RDX: %016llX\n", pExp->ContextRecord->Rcx, pExp->ContextRecord->Rdx);
+	fmt::append(msg, "RSI: %016llX  RDI: %016llX\n", pExp->ContextRecord->Rsi, pExp->ContextRecord->Rdi);
+	fmt::append(msg, "RBP: %016llX  RSP: %016llX\n", pExp->ContextRecord->Rbp, pExp->ContextRecord->Rsp);
+	fmt::append(msg, "R8:  %016llX  R9:  %016llX\n", pExp->ContextRecord->R8,  pExp->ContextRecord->R9);
+	fmt::append(msg, "R10: %016llX  R11: %016llX\n", pExp->ContextRecord->R10, pExp->ContextRecord->R11);
+	fmt::append(msg, "R12: %016llX  R13: %016llX\n", pExp->ContextRecord->R12, pExp->ContextRecord->R13);
+	fmt::append(msg, "R14: %016llX  R15: %016llX\n", pExp->ContextRecord->R14, pExp->ContextRecord->R15);
+	fmt::append(msg, "RFLAGS: %08X\n", pExp->ContextRecord->EFlags);
+#elif defined(ARCH_ARM64)
+	for (int i = 0; i < 29; i += 2)
+	{
+		if (i + 1 < 29)
+			fmt::append(msg, "X%-2d: %016llX  X%-2d: %016llX\n", i, pExp->ContextRecord->X[i], i + 1, pExp->ContextRecord->X[i + 1]);
+		else
+			fmt::append(msg, "X%-2d: %016llX\n", i, pExp->ContextRecord->X[i]);
+	}
+	fmt::append(msg, "SP: %016llX  FP: %016llX  LR: %016llX\n", pExp->ContextRecord->Sp, pExp->ContextRecord->Fp, pExp->ContextRecord->Lr);
+	fmt::append(msg, "CPSR: %08X\n", pExp->ContextRecord->Cpsr);
+#endif
+
+	const auto stack_trace = utils::get_backtrace(64, pExp->ContextRecord);
+	const auto stack_symbols = utils::get_backtrace_symbols(stack_trace);
+
+	msg += "Stack Trace:\n";
+
+	for (const auto& symbol : stack_symbols)
+	{
+		fmt::append(msg, "%s\n", symbol);
+	}
+	
+	sys_log.fatal("\n%s", msg);
+	logs::listener::sync_all();
+
+	thread_ctrl::emergency_exit(msg);
+}
+
+const bool s_exception_handler_set = []() -> bool
+{
+#ifdef USE_ASAN
+	if (!AddVectoredExceptionHandler(FALSE, static_cast<PVECTORED_EXCEPTION_HANDLER>(exception_handler)))
+#else
+	if (!AddVectoredExceptionHandler(1, static_cast<PVECTORED_EXCEPTION_HANDLER>(exception_handler)))
+#endif
+	{
+		report_fatal_error("AddVectoredExceptionHandler() failed.");
+	}
+
+	if (!SetUnhandledExceptionFilter(static_cast<LPTOP_LEVEL_EXCEPTION_FILTER>(exception_filter)))
+	{
+		report_fatal_error("SetUnhandledExceptionFilter() failed.");
+	}
+
+	return true;
+}();
+
+#else
+
+#ifdef __ANDROID__
+// The handlers that were installed before ours -- libsigchain's, which fronts ART and debuggerd.
+// Kept so that faults which are not the emulator's can be forwarded to them.
+static struct ::sigaction s_prev_fault_action[NSIG]{};
+
+// True when this fault is one the emulator's own memory model is responsible for.
+//
+// The ranges are exactly the ones the handler can act on: guest memory (try_get_addr spans 8GiB
+// from g_base_addr, so the sudo mirror is included), the executable map, and the segment map.
+// Everything else is somebody else's fault, in both senses.
+static bool is_emulator_fault(void* addr)
+{
+	const u64 exec64 = (reinterpret_cast<u64>(addr) - reinterpret_cast<u64>(vm::g_exec_addr)) / 2;
+	const u64 seg_off = (reinterpret_cast<u64>(addr) - reinterpret_cast<u64>(vm::g_exec_addr)) - vm::g_exec_addr_seg_offset;
+
+	return vm::try_get_addr(addr).second || exec64 < 0x100000000ull || seg_off < 0x80000000ull;
+}
+
+// Bionic's own sigaction, reached past libsigchain's interposition.
+//
+// libsigchain exports sigaction() and is loaded with global visibility, so an ordinary call
+// registers us INSIDE ART's chain -- behind its FaultManager, which is the entire problem. Looking
+// the symbol up in libc's own handle gets the real one, letting us install at the kernel level and
+// genuinely go first. RTLD_NOLOAD because libc is obviously already here; this must never load
+// anything. Returns null if bionic ever stops exporting it, and the caller then keeps the ordinary
+// registration rather than starting with no handler at all.
+using armsx3_sigaction_fn = int (*)(int, const struct ::sigaction*, struct ::sigaction*);
+
+static armsx3_sigaction_fn real_sigaction()
+{
+	void* const libc = ::dlopen("libc.so", RTLD_NOLOAD | RTLD_LOCAL);
+
+	return libc ? reinterpret_cast<armsx3_sigaction_fn>(::dlsym(libc, "sigaction")) : nullptr;
+}
+
+// Installs a fault handler, remembering what it replaced.
+static int install_fault_handler(int sig, const struct ::sigaction& sa)
+{
+	return ::sigaction(sig, &sa, sig > 0 && sig < NSIG ? &s_prev_fault_action[sig] : nullptr);
+}
+#else
+static int install_fault_handler(int sig, const struct ::sigaction& sa)
+{
+	return ::sigaction(sig, &sa, nullptr);
+}
+#endif
+
+// Installs a fault handler ahead of the Android runtime, not inside its chain.
+//
+// Two registrations were a mistake worth recording. Registering through the interposed sigaction()
+// AS WELL as at kernel level puts this handler in libsigchain's chain, so forwarding a fault that
+// is not ours goes to libsigchain, which walks its chain straight back to here, which forwards
+// again -- recursing until the alternate stack is gone. The process died of that with no
+// breadcrumb, no tombstone and no ART frames: quieter than the bug it was meant to fix.
+//
+// So: capture the handler the kernel currently calls (libsigchain's, which fronts ART), then
+// replace it, and never register through the interposed entry point for this signal. The chain we
+// forward into then does not contain us.
+static bool install_fault_handler_first(int sig, const struct ::sigaction& sa)
+{
+#ifdef __ANDROID__
+	if (const armsx3_sigaction_fn real_sa = real_sigaction())
+	{
+		if (real_sa(sig, nullptr, &s_prev_fault_action[sig]) != -1 && real_sa(sig, &sa, nullptr) != -1)
+		{
+			char line[96];
+
+			if (::snprintf(line, sizeof(line), "sigchain: installed ahead of the runtime for signal %d", sig) > 0)
+			{
+				__android_log_write(ANDROID_LOG_INFO, "ARMSX3", line);
+			}
+
+			return true;
+		}
+	}
+
+	__android_log_write(ANDROID_LOG_WARN, "ARMSX3", "sigchain: could not get ahead of the runtime; it will see faults first");
+#endif
+
+	// No bionic entry point, or it refused: fall back to the ordinary registration. The runtime
+	// then sees faults first, which is how this behaved before, crash included.
+	return install_fault_handler(sig, sa) != -1;
+}
+
+
+// What a SIGBUS was actually about. si_code is the only thing that tells an unbacked page apart
+// from a misaligned operand, and those point at completely different bugs.
+static const char* bus_error_kind(int code) noexcept
+{
+	switch (code)
+	{
+	case BUS_ADRALN: return "misaligned operand";
+	case BUS_ADRERR: return "mapped page has no backing";
+	case BUS_OBJERR: return "hardware error on the mapped object";
+	default: return "unrecognised si_code";
+	}
+}
+
+static void signal_handler(int sig, siginfo_t* info, void* uct) noexcept
+{
+	ucontext_t* context = static_cast<ucontext_t*>(uct);
+
+#ifdef __ANDROID__
+	// Not our fault: hand it to whoever we displaced.
+	//
+	// We install ahead of libsigchain deliberately (see the registration site), which means ART's
+	// FaultManager no longer sees the emulator's own faults -- it was reading guest registers as
+	// ArtMethod* and dying. But ART still needs its own faults: implicit null checks in JIT'd Java
+	// code arrive as SIGSEGV and are how a NullPointerException gets thrown. This forward is what
+	// keeps that working, and keeps ordinary tombstones for crashes that are genuinely elsewhere.
+	if (!is_emulator_fault(info->si_addr))
+	{
+		// Say whether this is a stack overflow before handing the fault on, because the tombstone
+		// cannot. A guard page is PROT_NONE, so overrunning a stack reports SEGV_ACCERR at an address
+		// that looks like any other bad pointer, and the backtrace shows only the JIT'd frame that
+		// happened to touch it -- nothing that says "you ran out of stack".
+		//
+		// Worth the cost here specifically: the ARM64 SPU gateway subtracts SPU_GW_SCRATCH_SIZE from
+		// sp per entry and unwinds by reloading sp rather than adding it back, so a path that re-enters
+		// without restoring walks the stack down in fixed steps to a guard page at a FIXED address --
+		// which is what a repeated identical fault address means. sp against the stack bounds tells
+		// that apart from one oversized function overflowing the scratchpad in a single call.
+		//
+		// Only runs on a fault that is already fatal, so pthread_getattr_np not being async-signal-safe
+		// costs nothing we still have.
+		//
+		// Skip a fault at address 0. On ARM64 that is how ART does both its implicit suspend
+		// checks and its implicit null checks -- a load through a register the runtime zeroes --
+		// so they land here on whichever managed thread happened to be running: the GC daemons,
+		// binder, hwui, the JIT. They are not crashes. libsigchain hands them to ART, which
+		// handles them and carries on, so the note above about this only running on an
+		// already-fatal fault is simply not true for them. Reporting each one wrote a
+		// fatal-level logcat line plus a register dump: 116 of them in twenty minutes of one
+		// tester's session, in the logs we ask people to send us. A real null dereference on a
+		// non-emulator thread still gets a tombstone from debuggerd, which is its proper reporter.
+#ifdef ARCH_ARM64
+		// Hard lifetime cap on this whole report.
+		//
+		// The note above says this only runs on a fault that is already fatal. That is not true on
+		// Android 15, whose ART uses a userfaultfd concurrent mark-compact collector: HeapTaskDaemon
+		// takes ordinary, recoverable faults at NON-ZERO addresses inside [anon:dalvik-LinearAlloc]
+		// as normal GC work, so they clear the fault_at != 0 filter above and get the full treatment
+		// -- pthread_getattr_np, an fopen and full parse of /proc/self/maps, and five logcat writes,
+		// per fault, inside a signal handler.
+		//
+		// Observed on an Odin 3 (Adreno 830, Android 15): 109 of these in about a second across
+		// HeapTaskDaemon, rumble-pump, pool-3-thread-1 and the main thread. The GC cannot make
+		// progress while every one of its faults parses the process map, so the Java heap stops, the
+		// UI never draws, and the app presents as hung with audio still playing -- audio being a
+		// native thread that needs nothing from the managed heap. It followed a VK_ERROR_DEVICE_LOST,
+		// so what should have been a fatal-error dialog became an indefinite freeze instead.
+		//
+		// The first few reports carry all the diagnostic value; a storm carries none and costs the
+		// process. Capping trades away stack-overflow detection for any overflow that happens after
+		// a storm has already burned the budget, which is the right way round: the storm makes the
+		// app unusable on its own, and a genuine crash elsewhere still gets a debuggerd tombstone.
+		static atomic_t<u32> s_foreign_fault_reports{0};
+
+		if (const u64 fault_at = reinterpret_cast<u64>(info->si_addr);
+			fault_at != 0 && s_foreign_fault_reports.fetch_add(1) < 8)
+		{
+			const u64 sp = static_cast<u64>(context->uc_mcontext.sp);
+
+			void* stack_addr = nullptr;
+			usz stack_size = 0;
+			pthread_attr_t attr;
+
+			if (pthread_getattr_np(pthread_self(), &attr) == 0)
+			{
+				pthread_attr_getstack(&attr, &stack_addr, &stack_size);
+				pthread_attr_destroy(&attr);
+			}
+
+			const u64 lo = reinterpret_cast<u64>(stack_addr);
+			const u64 hi = lo + stack_size;
+
+			char tname[32]{};
+			pthread_getname_np(pthread_self(), tname, sizeof(tname));
+
+			char line[512]{};
+
+			if (stack_size && fault_at < lo && lo - fault_at < 0x100000)
+			{
+				std::snprintf(line, sizeof(line),
+					"STACK OVERFLOW in '%s': fault 0x%llx is %llu bytes below the stack [0x%llx,0x%llx). "
+					"sp=0x%llx, %llu of %llu KB used (%.1f x 256KB gateway frames).",
+					tname, static_cast<unsigned long long>(fault_at),
+					static_cast<unsigned long long>(lo - fault_at),
+					static_cast<unsigned long long>(lo), static_cast<unsigned long long>(hi),
+					static_cast<unsigned long long>(sp),
+					static_cast<unsigned long long>((hi - sp) / 1024),
+					static_cast<unsigned long long>(stack_size / 1024),
+					static_cast<double>(hi - sp) / 262144.0);
+			}
+			else
+			{
+				std::snprintf(line, sizeof(line),
+					"non-emulator fault in '%s': addr=0x%llx sp=0x%llx stack=[0x%llx,0x%llx) %lluKB, "
+					"%llu KB of stack used. Not a guard page.",
+					tname, static_cast<unsigned long long>(fault_at),
+					static_cast<unsigned long long>(sp),
+					static_cast<unsigned long long>(lo), static_cast<unsigned long long>(hi),
+					static_cast<unsigned long long>(stack_size / 1024),
+					static_cast<unsigned long long>(stack_size ? (hi - sp) / 1024 : 0));
+			}
+
+			__android_log_write(ANDROID_LOG_FATAL, "ARMSX3", line);
+
+			// The faulting instruction and whichever registers formed the address.
+			//
+			// The address is identical across processes while the mappings around it move with
+			// ASLR, so it is computed rather than loaded from anything that got relocated. The
+			// encoding says which register was dereferenced and the register file says what went
+			// into it -- a base that should be a live pointer, an index that should have been
+			// masked, or a value that is simply guest data being used as a host address.
+			{
+				char regs[640]{};
+				int off = std::snprintf(regs, sizeof(regs), "  pc=0x%llx",
+					static_cast<unsigned long long>(context->uc_mcontext.pc));
+
+				// PC is what just executed, so it is mapped and readable.
+				const u32 insn = *reinterpret_cast<const u32*>(context->uc_mcontext.pc);
+				off += std::snprintf(regs + off, sizeof(regs) - off, " insn=0x%08x", insn);
+
+				for (int i = 0; i < 31 && off < static_cast<int>(sizeof(regs)) - 32; i++)
+				{
+					const u64 v = context->uc_mcontext.regs[i];
+
+					// Only the ones that plausibly built the address; a full dump is unreadable.
+					if (v == fault_at || (v <= fault_at && fault_at - v < 0x10000) || (v > fault_at && v - fault_at < 0x10000))
+					{
+						off += std::snprintf(regs + off, sizeof(regs) - off, " x%d=0x%llx%s",
+							i, static_cast<unsigned long long>(v), v == fault_at ? "(=fault)" : "");
+					}
+				}
+
+				__android_log_write(ANDROID_LOG_FATAL, "ARMSX3", regs);
+
+				// SPU context, to place the bad pointer against the things it could have come from.
+				//
+				// The value is byte-identical in every process while the mappings around it move,
+				// so it is not a relocated host pointer. LS is the one buffer whose CONTENTS are
+				// identical run to run, being guest data, so the question is whether this is a
+				// value read out of LS and used as a host address -- and if it is an LS access
+				// gone wrong, fault-ls lands inside or just past the 256K window.
+				if (const auto cpu_at_fault = get_current_cpu_thread();
+					cpu_at_fault && cpu_at_fault->get_class() == thread_class::spu)
+				{
+					const auto spu = static_cast<spu_thread*>(cpu_at_fault);
+					const u64 ls_base = reinterpret_cast<u64>(spu->ls);
+
+					char sc[512]{};
+					std::snprintf(sc, sizeof(sc),
+						"  spu: pc=0x%05x ls=0x%llx fault-ls=%lld (LS window is %u bytes) index=%u",
+						spu->pc, static_cast<unsigned long long>(ls_base),
+						static_cast<long long>(fault_at - ls_base),
+						static_cast<u32>(SPU_LS_SIZE), spu->index);
+					__android_log_write(ANDROID_LOG_FATAL, "ARMSX3", sc);
+				}
+			}
+
+			// Name the mapping the fault landed in.
+			//
+			// SEGV_ACCERR means the page is there and the access was refused, so the mapping's
+			// permissions and backing file are the whole answer -- and a tombstone prints neither.
+			// Reading maps from outside is not an option: /proc/<pid>/maps of another app is not
+			// readable by shell, and perf only records executable mappings, so a data mapping is
+			// invisible to both. In-process it is just a file.
+			{
+				if (FILE* maps = std::fopen("/proc/self/maps", "re"))
+				{
+					char row[512]{};
+					char prev1[640]{};
+					char prev2[640]{};
+
+					while (std::fgets(row, sizeof(row), maps))
+					{
+						u64 lo_a = 0, hi_a = 0;
+
+						if (std::sscanf(row, "%llx-%llx",
+							reinterpret_cast<unsigned long long*>(&lo_a),
+							reinterpret_cast<unsigned long long*>(&hi_a)) != 2)
+						{
+							continue;
+						}
+
+						if (fault_at >= lo_a && fault_at < hi_a)
+						{
+							if (char* nl = std::strchr(row, '\n')) *nl = '\0';
+
+							char hit[640]{};
+							std::snprintf(hit, sizeof(hit), "  fault mapping (+0x%llx into it): %s",
+								static_cast<unsigned long long>(fault_at - lo_a), row);
+							__android_log_write(ANDROID_LOG_FATAL, "ARMSX3", hit);
+
+							// Neighbours, because an anonymous PROT_NONE row identifies nothing on its
+							// own. The rows either side do: an rwx one above it means this is the
+							// uncommitted tail of the JIT pool, a named one means it belongs to whoever
+							// is named, and a stack guard sits next to a matching rw- stack.
+							if (prev2[0]) __android_log_write(ANDROID_LOG_FATAL, "ARMSX3", prev2);
+							if (prev1[0]) __android_log_write(ANDROID_LOG_FATAL, "ARMSX3", prev1);
+
+							for (int seen = 0; seen < 2 && std::fgets(row, sizeof(row), maps); seen++)
+							{
+								if (char* nl = std::strchr(row, '\n')) *nl = '\0';
+
+								char nxt[640]{};
+								std::snprintf(nxt, sizeof(nxt), "  after : %s", row);
+								__android_log_write(ANDROID_LOG_FATAL, "ARMSX3", nxt);
+							}
+
+							break;
+						}
+
+						std::snprintf(prev2, sizeof(prev2), "%s", prev1);
+						{
+							char tmp[512]{};
+							std::snprintf(tmp, sizeof(tmp), "%s", row);
+							if (char* nl = std::strchr(tmp, '\n')) *nl = '\0';
+							std::snprintf(prev1, sizeof(prev1), "  before: %s", tmp);
+						}
+					}
+
+					std::fclose(maps);
+				}
+			}
+		}
+#endif
+
+		// Forward once and once only. If whatever we forward to comes back here -- which it did
+		// while this handler was also registered inside libsigchain's chain -- looping would burn
+		// the alternate stack and kill the process silently. Second time through, stand down: put
+		// the PREVIOUS handler back and return, so the instruction faults again and the platform
+		// produces an honest tombstone instead of a recursion.
+		//
+		// It has to be the previous handler and not SIG_DFL. s_prev_fault_action is libsigchain's,
+		// which fronts ART and debuggerd, and debuggerd's handler is what writes the tombstone.
+		// Installing SIG_DFL does not "let the platform report it" -- it removes the only thing that
+		// would have. The re-fault then terminates the process by signal with no tombstone, nothing
+		// in the crash buffer, and nothing in logcat after the last line the emulator itself wrote.
+		//
+		// Observed on an Odin 3: a VK_ERROR_DEVICE_LOST teardown re-entered this handler and the
+		// process left as "exited due to signal 11 (Segmentation fault)" with no tombstone written,
+		// which is indistinguishable from a lowmemorykiller kill in the log and cost a long time to
+		// tell apart. This is the same restore-and-return the recoverable path already does further
+		// down; a handler that does not return cannot loop, and debuggerd's does not return.
+		static thread_local bool s_forwarding = false;
+
+		if (s_forwarding)
+		{
+			const struct ::sigaction& fallback = s_prev_fault_action[sig];
+
+			if (fallback.sa_sigaction && fallback.sa_handler != SIG_IGN)
+			{
+				::sigaction(sig, &fallback, nullptr);
+				return;
+			}
+
+			struct ::sigaction dfl{};
+			dfl.sa_handler = SIG_DFL;
+			sigemptyset(&dfl.sa_mask);
+			::sigaction(sig, &dfl, nullptr);
+			return;
+		}
+
+		const struct ::sigaction& prev = s_prev_fault_action[sig];
+		s_forwarding = true;
+
+		if ((prev.sa_flags & SA_SIGINFO) && prev.sa_sigaction)
+		{
+			prev.sa_sigaction(sig, info, uct);
+			s_forwarding = false;
+			return;
+		}
+
+		if (prev.sa_handler && prev.sa_handler != SIG_DFL && prev.sa_handler != SIG_IGN)
+		{
+			prev.sa_handler(sig);
+			s_forwarding = false;
+			return;
+		}
+
+		s_forwarding = false;
+	}
+#endif
+
+
+	// SIGBUS arrives here too now (see the sigaction block below), and never takes a recovery
+	// path. The recovery below is for pages this process protected itself, and a write to an
+	// mprotect'd page raises SIGSEGV/SEGV_ACCERR, never SIGBUS. A bus error means the page behind
+	// an otherwise valid address could not be produced at all -- unbacked, past the backing size,
+	// or an operand the instruction cannot address at that alignment. Nothing here changes any of
+	// those, so handling one and returning would re-execute the same instruction and fault again
+	// immediately: a livelock in place of a crash report.
+	const bool is_bus_error = sig == SIGBUS;
+
+#if defined(ARCH_X64)
+#ifdef __APPLE__
+	const u64 err = context->uc_mcontext->__es.__err;
+#elif defined(__DragonFly__) || defined(__FreeBSD__)
+	const u64 err = context->uc_mcontext.mc_err;
+#elif defined(__OpenBSD__)
+	const u64 err = context->sc_err;
+#elif defined(__NetBSD__)
+	const u64 err = context->uc_mcontext.__gregs[_REG_ERR];
+#else
+	const u64 err = context->uc_mcontext.gregs[REG_ERR];
+#endif
+
+	const bool is_executing = err & 0x10;
+	const bool is_writing = err & 0x2;
+#elif defined(ARCH_ARM64)
+	// Guess, replaced below by the hardware's own answer wherever that is available.
+	//
+	// This comparison is a heuristic and it decides something load-bearing: is_executing gates
+	// EVERY recovery path in this handler, so getting it wrong does not merely mislabel a log
+	// line, it skips handle_access_violation entirely and kills the thread. A data access whose
+	// faulting address happens to coincide with the PC is classified as an instruction fetch and
+	// takes that path, and the guest addresses most likely to collide are exactly the ones our
+	// own mappings sit at.
+	bool is_executing = uptr(info->si_addr) == uptr(RIP(context));
+
+#if defined(__linux__) || defined(__APPLE__)
+	// Current CPU state decoder is reverse-engineered from the linux kernel and may not work on other platforms.
+	const auto decoded_reason = aarch64::decode_fault_reason(context);
+	const bool is_writing = (decoded_reason == aarch64::fault_reason::data_write);
+
+	// ESR_EL1 says what the fault actually was, so prefer it over the address comparison.
+	//
+	// Only when the decode produced something meaningful: it returns 'undefined' when the signal
+	// frame carries no ESR record, and on that path the guess is still the best available answer.
+	// data_read/data_write are positive evidence that this is NOT an instruction fetch, which is
+	// the direction that matters -- it is what lets a genuine access violation reach the recovery
+	// path instead of terminating the thread.
+	if (decoded_reason == aarch64::fault_reason::data_read ||
+		decoded_reason == aarch64::fault_reason::data_write)
+	{
+		is_executing = false;
+	}
+	else if (decoded_reason == aarch64::fault_reason::instruction_execute)
+	{
+		is_executing = true;
+	}
+
+	if (decoded_reason != aarch64::fault_reason::data_write &&
+		decoded_reason != aarch64::fault_reason::data_read)
+	{
+		// We don't expect other classes of exceptions during normal executions
+		sig_log.warning("Unexpected fault. Reason: %d", static_cast<int>(decoded_reason));
+	}
+
+#else
+	const u32 insn = is_executing ? 0 : read_from_ptr_unsafe<u32>(RIP(context));
+	const bool is_writing =
+		(insn & 0xbfff0000) == 0x0c000000 ||  // STR <Wt>, [<Xn>, #<imm>] (store word with immediate offset)
+		(insn & 0xbfe00000) == 0x0c800000 ||  // STP <Wt1>, <Wt2>, [<Xn>, #<imm>] (store pair of registers with immediate offset)
+		(insn & 0xbfdf0000) == 0x0d000000 ||  // STR <Wt>, [<Xn>, <Xm>] (store word with register offset)
+		(insn & 0xbfc00000) == 0x0d800000 ||  // STP <Wt1>, <Wt2>, [<Xn>, <Xm>] (store pair of registers with register offset)
+		(insn & 0x3f400000) == 0x08000000 ||  // STR <Vd>, [<Xn>, #<imm>] (store SIMD/FP register with immediate offset)
+		(insn & 0x3bc00000) == 0x39000000 ||  // STR <Wt>, [<Xn>, #<imm>] (store word with immediate offset)
+		(insn & 0x3fc00000) == 0x3d800000 ||  // STR <Vd>, [<Xn>, <Xm>] (store SIMD/FP register with register offset)
+		(insn & 0x3bc00000) == 0x38000000 ||  // STR <Wt>, [<Xn>, <Xm>] (store word with register offset)
+		(insn & 0x3fe00000) == 0x3c800000 ||  // STUR <Vd>, [<Xn>, #<imm>] (store unprivileged register with immediate offset)
+		(insn & 0x3fe00000) == 0x3ca00000 ||  // STR <Vd>, [<Xn>, #<imm>] (store SIMD/FP register with immediate offset)
+		(insn & 0x3a400000) == 0x28000000 ||  // STP <Wt1>, <Wt2>, [<Xn>, #<imm>] (store pair of registers with immediate offset)
+		(insn & 0xbf000000) == 0xad000000 ||  // STP <Vd1>, <Vd2>, [<Xn>, #<imm>] (store SIMD/FP 128-bit register pair with immediate offset)
+		(insn & 0xbf000000) == 0x6d000000;    // STP <Dd1>, <Dd2>, [<Xn>, #<imm>] (store SIMD/FP 64-bit register pair with immediate offset)
+#endif
+
+#else
+#error "signal_handler not implemented"
+#endif
+
+	const u64 exec64 = (reinterpret_cast<u64>(info->si_addr) - reinterpret_cast<u64>(vm::g_exec_addr)) / 2;
+	// Segment map holds one u16 per 4 bytes of guest code: si_addr = g_exec_addr + g_exec_addr_seg_offset + (addr >> 1)
+	const u64 seg_off = (reinterpret_cast<u64>(info->si_addr) - reinterpret_cast<u64>(vm::g_exec_addr)) - vm::g_exec_addr_seg_offset;
+	const auto cause = is_executing ? "executing" : is_writing ? "writing" : "reading";
+
+	// Gated on more than "not an instruction fetch" now: see is_bus_error above.
+	const bool try_recovery = !is_executing && !is_bus_error;
+
+	if (auto [addr, ok] = vm::try_get_addr(info->si_addr); ok && try_recovery)
+	{
+		// Try to process access violation
+		if (thread_ctrl::get_current() && handle_access_violation(addr, is_writing, false, context))
+		{
+			return;
+		}
+	}
+
+	if (exec64 < 0x100000000ull && try_recovery)
+	{
+		if (thread_ctrl::get_current() && handle_access_violation(static_cast<u32>(exec64), is_writing, true, context))
+		{
+			return;
+		}
+	}
+	else if (seg_off < 0x80000000ull && try_recovery)
+	{
+		if (thread_ctrl::get_current() && handle_access_violation(static_cast<u32>(seg_off * 2), is_writing, true, context))
+		{
+			return;
+		}
+	}
+
+#ifdef __ANDROID__
+	// Raw state, before anything that can fault.
+	//
+	// Placed here deliberately: every recovery path above has already declined, so this only runs
+	// for faults that are actually fatal -- the write-protection faults the RSX relies on come
+	// through here hundreds of times a second and must not be logged at all.
+	//
+	// Everything below this point formats strings, allocates, takes the logger's locks and walks
+	// thread and guest state, and on a process sick enough to be here any of those can fault
+	// again. A second fault while this signal is blocked is force-delivered with the default
+	// action, killing the process instantly with the fatal message still sitting unflushed in the
+	// async log -- Borderlands 2 died that way three times, handler reached, nothing written.
+	//
+	// So: fixed stack buffers and liblog writes. No allocation, no locks, no ordering with the
+	// async log. Registers and the faulting instruction are what a wild address needs anyway --
+	// they say which operand went bad, which the formatted report never does.
+	{
+		char line[256];
+		const u64 pc = RIP(context);
+
+		if (::snprintf(line, sizeof(line), "fatal signal %d (si_code %d) at %p, pc 0x%llx, tid %d",
+			sig, info->si_code, info->si_addr, static_cast<unsigned long long>(pc),
+			static_cast<int>(::syscall(__NR_gettid))) > 0)
+		{
+			__android_log_write(ANDROID_LOG_FATAL, "ARMSX3", line);
+		}
+
+#if defined(ARCH_ARM64)
+		// Only when the fault was a data access: an instruction-fetch fault means pc itself is
+		// what could not be read, so reading it here would fault a second time.
+		if (!is_executing && ::snprintf(line, sizeof(line), "  insn 0x%08x", *reinterpret_cast<const u32*>(pc)) > 0)
+		{
+			__android_log_write(ANDROID_LOG_FATAL, "ARMSX3", line);
+		}
+
+		for (int i = 0; i < 31; i += 4)
+		{
+			char* p = line;
+			int rem = static_cast<int>(sizeof(line));
+
+			for (int j = i; j < i + 4 && j < 31; ++j)
+			{
+				const int w = ::snprintf(p, rem, "  x%d=0x%llx", j, static_cast<unsigned long long>(GPR(context, j)));
+
+				if (w <= 0 || w >= rem)
+				{
+					break;
+				}
+
+				p += w;
+				rem -= w;
+			}
+
+			__android_log_write(ANDROID_LOG_FATAL, "ARMSX3", line);
+		}
+#endif
+	}
+
+	// A fault outside guest memory is handed straight back to the platform's crash handler.
+	//
+	// Installing this handler displaced debuggerd's, which is why none of these crashes ever
+	// produced a tombstone: emergency_exit() takes the process down itself, throwing away the one
+	// artifact carrying a symbolised backtrace of every thread. For a guest access violation that
+	// is the right trade -- the emulator reports those far better than a tombstone would. For a
+	// fault at an address that is not guest memory, the backtrace IS the diagnosis: it names
+	// whoever handed out the corrupt pointer, which nothing here can work out by itself.
+	//
+	// Before the formatting below, not after, and this is the whole point: the report allocates,
+	// and on a process whose heap is already corrupt the allocation faults again. That second
+	// fault killed the process every time, so a chain placed after the report never ran.
+	//
+	// Restoring the previous handler and returning rather than re-raising: the faulting
+	// instruction executes again and faults again, so debuggerd sees the original pc, address and
+	// registers instead of this handler's frame. Ours is no longer installed, so there is no loop.
+	if (!vm::try_get_addr(info->si_addr).second && s_prev_fault_action[sig].sa_sigaction)
+	{
+		::sigaction(sig, &s_prev_fault_action[sig], nullptr);
+		return;
+	}
+#endif
+
+	// Named for what it was: a bus error reported as "Segfault" sends whoever reads the log
+	// looking for a bad pointer, when the address is usually fine and the mapping behind it is not.
+	std::string msg = sig == SIGBUS
+		? fmt::format("Bus error (%s) %s location %p at %p.\n", bus_error_kind(info->si_code), cause, info->si_addr, RIP(context))
+		: fmt::format("Segfault %s location %p at %p.\n", cause, info->si_addr, RIP(context));
+
+	if (vm::try_get_addr(info->si_addr).second)
+	{
+		fmt::append(msg, "Sudo Addr: %p, VM Addr: %p\n", vm::g_sudo_addr, vm::g_base_addr);
+	}
+
+	append_thread_name(msg);
+
+#ifdef __APPLE__
+	thread_local bool s_tls_is_attempting_recovery = false;
+	thread_local bool s_tls_last_cause_is_executing = false;
+
+	if (reinterpret_cast<u64>(info->si_addr) < 0x10000)
+	{
+		// Do not recover from the virtual page of 0x0 (such as nullptr)
+	}
+	else if (is_executing || is_writing)
+	{
+		if (s_tls_is_attempting_recovery && s_tls_last_cause_is_executing != is_executing)
+		{
+			// Cause changed, inform recovery
+			s_tls_is_attempting_recovery = false;
+		}
+
+		if (!s_tls_is_attempting_recovery)
+		{
+			s_tls_last_cause_is_executing = is_executing;
+			s_tls_is_attempting_recovery = true;
+			pthread_jit_write_protect_np(is_executing ? true : false);
+
+			sys_log.error("\n%s", msg);
+			sys_log.notice("\n%s", dump_useful_thread_info());
+			sys_log.error("Attempting recovery using pthread_jit_write_protect_np()");
+			logs::listener::sync_all();
+			return;
+		}
+	}
+#endif
+
+	sys_log.fatal("\n%s", msg);
+
+	// Flushed here rather than only after the dump. dump_useful_thread_info() walks thread state
+	// and guest memory, so it is the single most likely thing in this handler to fault again, and
+	// a fault there loses the fatal message with it -- it is still sitting in the async log's
+	// buffer at this point. The message is the part worth keeping; the dump is a bonus.
+	logs::listener::sync_all();
+
+	sys_log.notice("\n%s", dump_useful_thread_info());
+	logs::listener::sync_all();
+
+	if (IsDebuggerPresent())
+	{
+		// Convert to SIGTRAP
+		raise(SIGTRAP);
+		return;
+	}
+
+	thread_ctrl::emergency_exit(msg);
+}
+
+static void sigill_handler(int /*sig*/, siginfo_t* info, void* /*uct*/) noexcept
+{
+	std::string msg = fmt::format("Illegal instruction at %p (%s).\n", info->si_addr, *reinterpret_cast<be_t<u128>*>(info->si_addr));
+
+	append_thread_name(msg);
+
+	sys_log.fatal("\n%s", msg);
+	sys_log.notice("\n%s", dump_useful_thread_info());
+	logs::listener::sync_all();
+
+	if (IsDebuggerPresent())
+	{
+		// Convert to SIGTRAP
+		raise(SIGTRAP);
+		return;
+	}
+
+	thread_ctrl::emergency_exit(msg);
+}
+
+void sigpipe_signaling_handler(int)
+{
+}
+
+const bool s_exception_handler_set = []() -> bool
+{
+	struct ::sigaction sa;
+#ifdef __ANDROID__
+	// Run the handler on the alternate stack installed per thread in
+	// thread_base::initialize. Without this the handler runs on the faulting thread's own
+	// stack, so a stack overflow has nowhere to report itself from: the handler faults
+	// again immediately and the kernel applies the default action, killing the process
+	// having written nothing.
+	//
+	// Arkham City does exactly that. The only record anywhere of the crash was a single
+	// Zygote line, "exited due to signal 11 (Segmentation fault)", with no tombstone, no
+	// crash-buffer entry and no line from this handler, which cost hours of diagnosing it
+	// as an external kill.
+	sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+#else
+	sa.sa_flags = SA_SIGINFO;
+#endif
+	sigemptyset(&sa.sa_mask);
+	sa.sa_sigaction = signal_handler;
+
+	if (!install_fault_handler_first(SIGSEGV, sa))
+	{
+		std::fprintf(stderr, "sigaction(SIGSEGV) failed (%d).\n", errno);
+		std::abort();
+	}
+
+#if defined(__APPLE__) || defined(__ANDROID__)
+	// Android too, and not for tidiness: with no handler, SIGBUS takes the default action and
+	// the process dies having written nothing at all -- no line from this handler, no tombstone,
+	// and an RPCSX.log that simply stops mid-sentence. The only record of Borderlands 2 dying
+	// this way was one Zygote line, "exited due to signal 7 (Bus error)".
+	//
+	// It is a fault class this emulator can genuinely hit. Guest memory is a MAP_SHARED mapping
+	// of a memfd, and a shared file mapping raises SIGBUS rather than SIGSEGV whenever the page
+	// behind an otherwise valid address cannot be produced -- past the backing size, or with
+	// nothing left to back it. None of that is recoverable here, but all of it is diagnosable,
+	// and none of it was.
+	if (!install_fault_handler_first(SIGBUS, sa))
+	{
+		std::fprintf(stderr, "sigaction(SIGBUS) failed (%d).\n", errno);
+		std::abort();
+	}
+#endif
+
+	sa.sa_sigaction = sigill_handler;
+	if (install_fault_handler(SIGILL, sa) == -1)
+	{
+		std::fprintf(stderr, "sigaction(SIGILL) failed (%d).\n", errno);
+		std::abort();
+	}
+
+	sa.sa_handler = sigpipe_signaling_handler;
+	if (::sigaction(SIGPIPE, &sa, NULL) == -1)
+	{
+		std::fprintf(stderr, "sigaction(SIGPIPE) failed (%d).\n", errno);
+		std::abort();
+	}
+
+	std::printf("Debugger: %d\n", +IsDebuggerPresent());
+	return true;
+}();
+
+#endif
+
+const bool s_terminate_handler_set = []() -> bool
+{
+	std::set_terminate([]()
+	{
+		// Re-entrancy guard. Under memory exhaustion the terminate path itself allocates
+		// (report_fatal_error formats a message -> operator new; with -fno-exceptions a failed
+		// allocation calls std::terminate again), which recurses forever and buries the real
+		// crash under a stack of aborts. If terminate re-enters, hard-stop without allocating
+		// so there is exactly one clean tombstone.
+		// Ported from ouroboros420/rpcsx (281654906).
+		static atomic_t<int> s_terminating{0};
+
+		if (s_terminating.exchange(1) != 0)
+		{
+			::signal(SIGABRT, SIG_DFL);
+			std::abort();
+		}
+
+		if (IsDebuggerPresent())
+		{
+			logs::listener::sync_all();
+			utils::trap();
+		}
+
+		report_fatal_error("RPCS3 has abnormally terminated.");
+	});
+
+	return true;
+}();
+
+thread_local DECLARE(thread_ctrl::g_tls_this_thread) = nullptr;
+
+thread_local DECLARE(thread_ctrl::g_tls_error_callback) = nullptr;
+
+DECLARE(thread_ctrl::g_native_core_layout) { native_core_arrangement::undefined };
+
+void thread_base::start()
+{
+	m_sync.atomic_op([&](u32& v)
+	{
+		v &= ~static_cast<u32>(thread_state::mask);
+		v |= static_cast<u32>(thread_state::created);
+	});
+
+#ifdef _WIN32
+	m_thread = ::_beginthreadex(nullptr, 0, entry_point, this, CREATE_SUSPENDED, nullptr);
+	ensure(m_thread);
+	ensure(::ResumeThread(reinterpret_cast<HANDLE>(+m_thread)) != static_cast<DWORD>(-1));
+#elif defined(__APPLE__)
+	pthread_attr_t attrs;
+	pthread_t thread_id{};
+	struct sched_param sp;
+	memset(&sp, 0, sizeof(struct sched_param));
+	sp.sched_priority=99;
+	pthread_attr_init(&attrs);
+	pthread_attr_setstacksize(&attrs, 0x800000);
+	
+	pthread_attr_set_qos_class_np(&attrs, QOS_CLASS_USER_INTERACTIVE, 0);
+	pthread_attr_setschedpolicy(&attrs, SCHED_RR);
+	pthread_attr_setschedparam(&attrs, &sp);
+	ensure(pthread_create(&thread_id, &attrs, entry_point, this) == 0);
+#else
+	pthread_t thread_id{};
+
+#ifdef __ANDROID__
+	// Give Android threads the stack desktop Linux already gives them.
+	//
+	// bionic's default is 1 MB; glibc's is 8 MB. Passing null attributes here meant every emulator
+	// thread on Android ran on an eighth of the stack the same code gets everywhere else, and
+	// nothing said so -- an SPU thread's stack mapping measured 0xfc000.
+	//
+	// Address space only; stack pages are committed on first use.
+	pthread_attr_t attrs;
+	pthread_attr_init(&attrs);
+	pthread_attr_setstacksize(&attrs, 0x800000);
+	const int rc = pthread_create(&thread_id, &attrs, entry_point, this);
+	pthread_attr_destroy(&attrs);
+	ensure(rc == 0);
+#else
+	ensure(pthread_create(&thread_id, nullptr, entry_point, this) == 0);
+#endif
+#endif
+
+#ifndef _WIN32
+	// Update m_thread atomically
+	u64 dest_id = 0;
+	std::memcpy(&dest_id, &thread_id, sizeof(thread_id));
+
+	if (!m_thread && !m_thread.compare_and_swap_test(0, dest_id))
+	{
+		ensure(m_thread == dest_id);
+	}
+#endif
+}
+
+void thread_base::initialize(void (*error_cb)())
+{
+#ifdef __ANDROID__
+	// Somewhere for the SIGSEGV handler to run, per thread. See SA_ONSTACK above.
+	//
+	// Deliberately a thread_local rather than a shared buffer: the handler can fire on any
+	// thread, two threads can fault at once, and a shared stack would corrupt whichever
+	// report lost the race. It is released with the thread, after which no handler can run
+	// on it.
+	//
+	// 128KB because the handler formats and logs rather than just setting a flag. That is
+	// real memory across the emulator's thread count, and it buys turning a silent death
+	// into a reported one.
+	static thread_local std::array<u8, 128 * 1024> s_signal_stack;
+
+	stack_t alt{};
+	alt.ss_sp = s_signal_stack.data();
+	alt.ss_size = s_signal_stack.size();
+	alt.ss_flags = 0;
+
+	if (::sigaltstack(&alt, nullptr) == -1)
+	{
+		// Not fatal: the handler simply falls back to the faulting stack, which is the
+		// behaviour everywhere else. Worth knowing about, because it means a stack
+		// overflow will go unreported again.
+		sig_log.error("sigaltstack failed (%d); stack overflows will not be reported", errno);
+	}
+#endif
+
+#ifndef _WIN32
+#ifdef __APPLE__
+	while (!m_thread)
+	{
+		busy_wait();
+	}
+	[[maybe_unused]] u64 new_tid = 0;
+#elif defined(ANDROID)
+	const u64 new_tid = pthread_self();
+	m_native_tid = static_cast<u32>(gettid());
+#else
+	const u64 new_tid = reinterpret_cast<u64>(pthread_self());
+#endif
+
+	if (!m_thread && !m_thread.compare_and_swap_test(0, new_tid))
+	{
+		ensure(m_thread == new_tid);
+	}
+#endif
+
+	// Initialize TLS variables
+	thread_ctrl::g_tls_this_thread = this;
+
+	thread_ctrl::g_tls_error_callback = error_cb;
+
+	g_tls_log_prefix = []
+	{
+		return thread_ctrl::get_name_cached();
+	};
+
+	atomic_wait_engine::set_wait_callback([](const void*, u64 attempts, u64 stamp0) -> bool
+	{
+		if (attempts == umax)
+		{
+			g_tls_wait_time += utils::get_tsc() - stamp0;
+		}
+		else if (attempts > 1)
+		{
+			g_tls_wait_fail += attempts - 1;
+		}
+
+		return true;
+	});
+
+	set_name(thread_ctrl::get_name_cached());
+}
+
+void thread_base::set_name(std::string name)
+{
+#ifdef _WIN32
+	if (SetThreadDescriptionImport)
+	{
+		SetThreadDescriptionImport(GetCurrentThread(), utf8_to_wchar(name).c_str());
+	}
+#endif
+
+#ifdef _MSC_VER
+	struct THREADNAME_INFO
+	{
+		DWORD dwType;
+		LPCSTR szName;
+		DWORD dwThreadID;
+		DWORD dwFlags;
+	};
+
+	// Set thread name for VS debugger
+	if (IsDebuggerPresent()) [&]() NEVER_INLINE
+	{
+		THREADNAME_INFO info;
+		info.dwType = 0x1000;
+		info.szName = name.c_str();
+		info.dwThreadID = -1;
+		info.dwFlags = 0;
+
+		__try
+		{
+			RaiseException(0x406D1388, 0, sizeof(info) / sizeof(ULONG_PTR), (ULONG_PTR*)&info);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+		}
+	}();
+#endif
+
+#if defined(__APPLE__)
+	name.resize(std::min<usz>(15, name.size()));
+	pthread_setname_np(name.c_str());
+#elif defined(__DragonFly__) || defined(__FreeBSD__) || defined(__OpenBSD__)
+	pthread_set_name_np(pthread_self(), name.c_str());
+#elif defined(__NetBSD__)
+	pthread_setname_np(pthread_self(), "%s", name.data());
+#elif !defined(_WIN32)
+	name.resize(std::min<usz>(15, name.size()));
+	pthread_setname_np(pthread_self(), name.c_str());
+#endif
+}
+
+u64 thread_base::finalize(thread_state result_state) noexcept
+{
+	// Report pending errors
+	error_code::error_report(0, nullptr, nullptr, nullptr, nullptr);
+
+#ifdef _WIN32
+	static thread_local ULONG64 tls_cycles{};
+	static thread_local u64 tls_time{};
+	ULONG64 cycles{};
+	QueryThreadCycleTime(GetCurrentThread(), &cycles);
+	cycles -= tls_cycles;
+	tls_cycles += cycles;
+	FILETIME ctime, etime, ktime, utime;
+	GetThreadTimes(GetCurrentThread(), &ctime, &etime, &ktime, &utime);
+	const u64 time = ((ktime.dwLowDateTime | static_cast<u64>(ktime.dwHighDateTime) << 32) + (utime.dwLowDateTime | static_cast<u64>(utime.dwHighDateTime) << 32)) * 100ull - tls_time;
+	tls_time += time;
+	const u64 fsoft = 0;
+	const u64 fhard = 0;
+	const u64 ctxvol = 0;
+	const u64 ctxinv = 0;
+#elif defined(RUSAGE_THREAD)
+	static thread_local u64 tls_time{}, tls_fsoft{}, tls_fhard{}, tls_ctxvol{}, tls_ctxinv{};
+	const u64 cycles = 0; // Not supported
+	struct ::rusage stats{};
+	::getrusage(RUSAGE_THREAD, &stats);
+	const u64 time = (stats.ru_utime.tv_sec + stats.ru_stime.tv_sec) * 1000000000ull + (stats.ru_utime.tv_usec + stats.ru_stime.tv_usec) * 1000ull - tls_time;
+	tls_time += time;
+	const u64 fsoft = stats.ru_minflt - tls_fsoft;
+	tls_fsoft += fsoft;
+	const u64 fhard = stats.ru_majflt - tls_fhard;
+	tls_fhard += fhard;
+	const u64 ctxvol = stats.ru_nvcsw - tls_ctxvol;
+	tls_ctxvol += ctxvol;
+	const u64 ctxinv = stats.ru_nivcsw - tls_ctxinv;
+	tls_ctxinv += ctxinv;
+#else
+	const u64 cycles = 0;
+	const u64 time = 0;
+	const u64 fsoft = 0;
+	const u64 fhard = 0;
+	const u64 ctxvol = 0;
+	const u64 ctxinv = 0;
+#endif
+
+	g_tls_log_prefix = []
+	{
+		return thread_ctrl::get_name_cached();
+	};
+
+	const bool is_cpu_thread = !!cpu_thread::get_current();
+	auto& thread_log = (is_cpu_thread || g_tls_fault_all ? sig_log.notice : sig_log.trace);
+
+	thread_log("Thread time: %fs (%fGc); Faults: %u [rsx:%u, spu:%u]; [soft:%u hard:%u]; Switches:[vol:%u unvol:%u]; Wait:[%.3fs, spur:%u]",
+		time / 1000000000.,
+		cycles / 1000000000.,
+		g_tls_fault_all,
+		g_tls_fault_rsx,
+		g_tls_fault_spu,
+		fsoft, fhard, ctxvol, ctxinv,
+		g_tls_wait_time / (utils::get_tsc_freq() / 1.),
+		g_tls_wait_fail);
+
+	atomic_wait_engine::set_wait_callback(nullptr);
+
+	// Avoid race with the destructor
+	const u64 _self = m_thread;
+
+#ifdef ANDROID
+	m_native_tid = 0;
+#endif
+
+	// Set result state (errored or finalized)
+	m_sync.fetch_op([&](u32& v)
+	{
+		v &= -4;
+		v |= static_cast<u32>(result_state);
+	});
+
+	// Signal waiting threads
+	m_sync.notify_all();
+
+	return _self;
+}
+
+thread_base::native_entry thread_base::finalize(u64 _self) noexcept
+{
+	g_tls_fault_all = 0;
+	g_tls_fault_rsx = 0;
+	g_tls_fault_spu = 0;
+	g_tls_wait_time = 0;
+	g_tls_wait_fail = 0;
+	g_tls_access_violation_recovered = umax;
+
+	g_tls_log_prefix = []() -> std::string { return {}; };
+
+	if (_self == umax)
+	{
+		thread_ctrl::g_tls_this_thread = nullptr;
+		return nullptr;
+	}
+
+#ifdef _WIN32
+	_endthreadex(0);
+#else
+	pthread_exit(nullptr);
+#endif
+
+	return nullptr;
+}
+
+thread_base::native_entry thread_base::make_trampoline(u64(*entry)(thread_base* _base))
+{
+	return build_function_asm<native_entry>("", [&](native_asm& c, auto& args)
+	{
+		using namespace asmjit;
+
+#if defined(ARCH_X64)
+		Label _ret = c.newLabel();
+		c.push(x86::rbp);
+		c.sub(x86::rsp, 0x20);
+
+		// Call entry point (TODO: support for detached threads missing?)
+		c.call(entry);
+
+		// Call finalize, return if zero
+		c.mov(args[0], x86::rax);
+		c.call(static_cast<native_entry(*)(u64)>(&finalize));
+		c.test(x86::rax, x86::rax);
+		c.jz(_ret);
+
+		// Otherwise, call it as an entry point with first arg = new current thread
+		c.mov(x86::rbp, x86::rax);
+		c.call(thread_ctrl::get_current);
+		c.mov(args[0], x86::rax);
+		c.add(x86::rsp, 0x28);
+		c.jmp(x86::rbp);
+
+		c.bind(_ret);
+		c.add(x86::rsp, 0x28);
+		c.ret();
+#else
+	UNUSED(c);
+	UNUSED(args);
+	UNUSED(entry);
+#endif
+	});
+}
+
+thread_state thread_ctrl::state()
+{
+	auto _this = g_tls_this_thread;
+
+	// Guard for recursive calls (TODO: may be more effective to reuse one of m_sync bits)
+	static thread_local bool s_tls_exec = false;
+
+	// Drain execution queue
+	if (!s_tls_exec)
+	{
+		s_tls_exec = true;
+		_this->exec();
+		s_tls_exec = false;
+	}
+
+	return static_cast<thread_state>(_this->m_sync & 3);
+}
+
+void thread_ctrl::wait_for(u64 usec, [[maybe_unused]] bool alert /* true */)
+{
+	if (!usec)
+	{
+		return;
+	}
+
+	auto _this = g_tls_this_thread;
+
+	if (!alert && usec > 50000)
+	{
+		usec = 50000;
+	}
+
+#ifdef __linux__
+	static thread_local struct linux_timer_handle_t
+	{
+		// Allocate timer only if needed (i.e. someone calls wait_for with alert and short period)
+		const int m_timer = timerfd_create(CLOCK_MONOTONIC, 0);
+
+		linux_timer_handle_t() noexcept
+		{
+			if (m_timer == -1)
+			{
+				sig_log.error("Linux timer allocation failed, using the fallback instead.");
+			}
+		}
+
+		operator int() const
+		{
+			return m_timer;
+		}
+
+		~linux_timer_handle_t()
+		{
+			if (m_timer != -1)
+			{
+				close(m_timer);
+			}
+		}
+	} fd_timer;
+
+	if (!alert && fd_timer != -1)
+	{
+		struct itimerspec timeout;
+		u64 missed;
+
+		timeout.it_value.tv_nsec = usec % 1'000'000 * 1'000ull;
+		timeout.it_value.tv_sec = usec / 1'000'000;
+		timeout.it_interval.tv_sec = 0;
+		timeout.it_interval.tv_nsec = 0;
+		timerfd_settime(fd_timer, 0, &timeout, NULL);
+		if (read(fd_timer, &missed, sizeof(missed)) != sizeof(missed))
+			sig_log.error("timerfd: read() failed");
+		return;
+	}
+#endif
+
+	if (alert)
+	{
+		if (_this->m_sync.bit_test_reset(2) || _this->m_taskq)
+		{
+			return;
+		}
+	}
+
+	// Wait for signal and thread state abort
+	atomic_wait::list<2> list{};
+
+	if (alert)
+	{
+		list.set<0>(_this->m_sync, 0);
+		list.template set<1>(_this->m_taskq);
+	}
+	else
+	{
+		list.set<0>(_this->m_dummy, 0);
+	}
+
+	list.wait(atomic_wait_timeout{usec <= 0xffff'ffff'ffff'ffff / 1000 ? usec * 1000 : 0xffff'ffff'ffff'ffff});
+}
+
+
+void thread_ctrl::wait_until(u64* wait_time, u64 add_time, u64 min_wait, bool update_to_current_time)
+{
+	*wait_time = utils::add_saturate<u64>(*wait_time, add_time);
+
+	// TODO: Implement proper support for "waiting until" inside atomic wait engine
+	const u64 current_time = get_system_time();
+
+	if (current_time > *wait_time)
+	{
+		if (update_to_current_time)
+		{
+			*wait_time = current_time + (add_time - (current_time - *wait_time) % add_time);
+		}
+		else if (!min_wait)
+		{
+			return;
+		}
+	}
+
+	if (min_wait)
+	{
+		*wait_time = std::max<u64>(*wait_time, utils::add_saturate<u64>(current_time, min_wait));
+	}
+
+	wait_for(*wait_time - current_time);
+}
+
+void thread_ctrl::wait_for_accurate(u64 usec)
+{
+	if (!usec)
+	{
+		return;
+	}
+
+	if (usec > 50000)
+	{
+		fmt::throw_exception("thread_ctrl::wait_for_accurate: unsupported amount");
+	}
+
+#ifdef __linux__
+	return wait_for(usec, false);
+#else
+	using namespace std::chrono_literals;
+
+	const auto until = std::chrono::steady_clock::now() + 1us * usec;
+
+	while (true)
+	{
+		// Host scheduler quantum for windows (worst case)
+		constexpr u64 host_min_quantum = 500;
+
+		if (usec >= host_min_quantum)
+		{
+			// Wait on multiple of min quantum for large durations to avoid overloading low thread cpus
+			wait_for(usec - (usec % host_min_quantum), false);
+		}
+		// TODO: Determine best value for yield delay
+		else if (usec >= host_min_quantum / 2)
+		{
+			std::this_thread::yield();
+		}
+		else
+		{
+			busy_wait(100);
+		}
+
+		const auto current = std::chrono::steady_clock::now();
+
+		if (current >= until)
+		{
+			break;
+		}
+
+		usec = std::chrono::duration_cast<std::chrono::microseconds>(until - current).count();
+	}
+#endif
+}
+
+std::string thread_ctrl::get_name_cached()
+{
+	auto _this = thread_ctrl::g_tls_this_thread;
+
+	if (!_this)
+	{
+		return {};
+	}
+
+	static thread_local shared_ptr<std::string> name_cache;
+
+	if (!_this->m_tname.is_equal(name_cache)) [[unlikely]]
+	{
+		_this->m_tname.peek_op([&](const shared_ptr<std::string>& ptr)
+		{
+			if (ptr != name_cache)
+			{
+				name_cache = ptr;
+			}
+		});
+	}
+
+	return *name_cache;
+}
+
+thread_base::thread_base(native_entry entry, std::string name) noexcept
+	: entry_point(entry)
+	, m_tname(make_single_value(std::move(name)))
+{
+}
+
+thread_base::~thread_base() noexcept
+{
+	// Cleanup abandoned tasks: initialize default results and signal
+	this->exec();
+
+	// Cleanup
+	{
+#ifdef _WIN32
+		const HANDLE handle0 = reinterpret_cast<HANDLE>(m_thread.load());
+		WaitForSingleObject(handle0, INFINITE);
+		CloseHandle(handle0);
+#elif defined(ANDROID)
+		pthread_join(m_thread.load(), nullptr);
+#else
+		pthread_join(reinterpret_cast<pthread_t>(m_thread.load()), nullptr);
+#endif
+	}
+}
+
+bool thread_base::join(bool dtor) const
+{
+	// Check if already finished
+	if (m_sync & 2)
+	{
+		return (m_sync & 3) == 3;
+	}
+
+	// Hacked for too sleepy threads (1ms) TODO: make sure it's unneeded and remove
+	const auto timeout = dtor && Emu.IsStopped() ? atomic_wait_timeout{1'000'000} : atomic_wait_timeout::inf;
+
+	auto stamp0 = utils::get_tsc();
+
+	for (u64 i = 0; (m_sync & 3) <= 1; i++)
+	{
+		m_sync.wait(m_sync & ~2, timeout);
+
+		if (m_sync & 2)
+		{
+			break;
+		}
+
+		if (i >= 16 && !(i & (i - 1)) && timeout != atomic_wait_timeout::inf)
+		{
+			sig_log.error("Thread [%s] is too sleepy. Waiting for it %.3fus already!", *m_tname.load(), (utils::get_tsc() - stamp0) / (utils::get_tsc_freq() / 1000000.));
+		}
+	}
+
+	return (m_sync & 3) == 3;
+}
+
+void thread_base::notify()
+{
+	// Set notification
+	m_sync |= 4;
+	m_sync.notify_all();
+}
+
+u64 thread_base::get_native_id() const
+{
+#ifdef _WIN32
+	return GetThreadId(reinterpret_cast<HANDLE>(m_thread.load()));
+#else
+	return m_thread.load();
+#endif
+}
+
+u64 thread_base::get_cycles()
+{
+	u64 cycles = 0;
+
+	const u64 handle = m_thread;
+
+#ifdef _WIN32
+	if (QueryThreadCycleTime(reinterpret_cast<HANDLE>(handle), &cycles))
+	{
+#elif __APPLE__
+	mach_port_name_t port = pthread_mach_thread_np(reinterpret_cast<pthread_t>(handle));
+	mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+	thread_basic_info_data_t info;
+	kern_return_t ret = thread_info(port, THREAD_BASIC_INFO, reinterpret_cast<thread_info_t>(&info), &count);
+	if (ret == KERN_SUCCESS)
+	{
+		cycles = static_cast<u64>(info.user_time.seconds + info.system_time.seconds) * 1'000'000'000 +
+			static_cast<u64>(info.user_time.microseconds + info.system_time.microseconds) * 1'000;
+#else
+	clockid_t _clock;
+	struct timespec thread_time;
+#ifdef ANDROID
+	const u32 native_tid = m_native_tid;
+
+	if (!handle || !native_tid)
+	{
+		return m_cycles;
+	}
+
+	_clock = (~static_cast<clockid_t>(native_tid) << 3) | 6;
+
+	if (!clock_gettime(_clock, &thread_time))
+#else
+	pthread_t thread_id = reinterpret_cast<pthread_t>(handle);
+
+	if (!pthread_getcpuclockid(thread_id, &_clock) && !clock_gettime(_clock, &thread_time))
+#endif
+	{
+		cycles = static_cast<u64>(thread_time.tv_sec) * 1'000'000'000 + thread_time.tv_nsec;
+#endif
+		if (const u64 old_cycles = m_cycles.exchange(cycles))
+		{
+			return cycles - old_cycles;
+		}
+
+		// Report 0 the first time this function is called
+		return 0;
+	}
+	else
+	{
+		return m_cycles;
+	}
+}
+
+void thread_base::push(shared_ptr<thread_future> task)
+{
+	const auto next = &task->next;
+	m_taskq.push_head(*next, std::move(task));
+	m_taskq.notify_one();
+}
+
+void thread_base::exec()
+{
+	if (!m_taskq) [[likely]]
+	{
+		return;
+	}
+
+	while (shared_ptr<thread_future> head = m_taskq.exchange(null_ptr))
+	{
+		// TODO: check if adapting reverse algorithm is feasible here
+		thread_future* prev_head{head.get()};
+
+		for (thread_future* prev{};;)
+		{
+			utils::prefetch_exec(prev_head->exec.load());
+
+			if (auto next = prev_head->next.get())
+			{
+				prev = std::exchange(prev_head, next);
+				prev_head->prev = prev;
+			}
+			else
+			{
+				break;
+			}
+		}
+
+		for (auto ptr = prev_head; ptr; ptr = ptr->prev)
+		{
+			if (auto task = ptr->exec.load()) [[likely]]
+			{
+				// Execute or discard (if aborting)
+				if ((m_sync & 3) == 0) [[likely]]
+				{
+					task(this, ptr);
+				}
+				else
+				{
+					task(nullptr, ptr);
+				}
+
+				// Notify waiters
+				ptr->done.release(1);
+				ptr->done.notify_all();
+			}
+
+			if (ptr->next)
+			{
+				// Partial cleanup
+				ptr->next.reset();
+			}
+		}
+
+		if (!m_taskq) [[likely]]
+		{
+			return;
+		}
+	}
+}
+
+void thread_ctrl::set_name(std::string name)
+{
+	ensure(g_tls_this_thread);
+	g_tls_this_thread->m_tname.store(make_single<std::string>(name));
+	g_tls_this_thread->set_name(std::move(name));
+}
+
+[[noreturn]] void thread_ctrl::emergency_exit(std::string_view reason)
+{
+	// Print stacktrace
+#ifdef __cpp_lib_stacktrace
+	if (rpcs3::is_local_build())
+	{
+		std::ostringstream oss;
+		oss << std::stacktrace::current();
+		sys_log.notice("StackTrace\n\n%s\n", oss.str());
+	}
+#endif
+
+	if (const std::string info = dump_useful_thread_info(); !info.empty())
+	{
+		sys_log.notice("\n%s", info);
+	}
+
+	std::string reason_buf;
+
+	if (auto ppu = cpu_thread::get_current<ppu_thread>())
+	{
+		if (auto func = ppu->current_function)
+		{
+			fmt::append(reason_buf, "%s (PPU: %s)", reason, func);
+		}
+	}
+
+	if (auto [total, current] = utils::get_memory_usage(); total - current <= 256 * 1024 * 1024)
+	{
+		if (reason_buf.empty())
+		{
+			reason_buf = std::string{reason};
+		}
+
+		fmt::append(reason_buf, " (Possible RAM deficiency: free RAM: %dMB)", (total - current) / (1024 * 1024));
+	}
+
+	if (!reason_buf.empty())
+	{
+		reason = reason_buf;
+	}
+
+	sig_log.fatal("Thread terminated due to fatal error: %s", reason);
+
+	logs::listener::sync_all();
+
+	if (IsDebuggerPresent())
+	{
+		// Prevent repeatedly halting the debugger in case multiple threads crashed at once
+		static atomic_t<u64> s_last_break = 0;
+		const u64 current_break = get_system_time() & -2;
+
+		if (s_last_break.fetch_op([current_break](u64& v)
+		{
+			if (current_break >= (v & -2) && current_break - (v & -2) >= 20'000'000)
+			{
+				v = current_break;
+				return true;
+			}
+
+			// Let's allow a single more thread to halt the debugger so the programmer sees the pattern
+			if (!(v & 1))
+			{
+				v |= 1;
+				return true;
+			}
+
+			return false;
+		}).second)
+		{
+#ifndef __APPLE__
+			utils::trap();
+#endif
+		}
+	}
+
+	if (const auto _this = g_tls_this_thread)
+	{
+		g_tls_error_callback();
+
+		u64 _self = _this->finalize(thread_state::errored);
+
+		if (_self == umax)
+		{
+			// Unused, detached thread support remnant
+			delete _this;
+		}
+
+		thread_base::finalize(umax);
+
+#ifdef _WIN32
+		_endthreadex(0);
+#else
+		pthread_exit(nullptr);
+#endif
+	}
+
+	report_fatal_error(reason);
+}
+
+void thread_ctrl::silent_exit() noexcept
+{
+	if (const auto _this = g_tls_this_thread)
+	{
+		g_tls_error_callback();
+
+		u64 _self = _this->finalize(thread_state::errored);
+
+		if (_self == umax)
+		{
+			// Unused, detached thread support remnant
+			delete _this;
+		}
+
+		thread_base::finalize(umax);
+	}
+
+#ifdef _WIN32
+	_endthreadex(0);
+#else
+	pthread_exit(nullptr);
+#endif
+
+	std::abort();
+}
+
+
+#if defined(ARCH_ARM64) && defined(__linux__)
+// Per-core capacity from sysfs, read ONCE.
+//
+// Deliberately plain POSIX I/O rather than fs::file: sysfs nodes report
+// st_size == 0, so a size-based read returns nothing, and fs::file raised
+// "Unexpected fs::error OK" from whichever thread asked -- which killed the RSX
+// thread outright, since get_affinity_mask() runs on it.
+static const std::array<u32, 64>& get_arm_core_capacities()
+{
+	static const std::array<u32, 64> s_caps = []
+	{
+		std::array<u32, 64> caps{};
+
+		for (u32 core = 0; core < 64u; core++)
+		{
+			char path[128];
+			std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%u/cpu_capacity", core);
+
+			const int fd = ::open(path, O_RDONLY | O_CLOEXEC);
+			if (fd < 0)
+			{
+				continue;
+			}
+
+			char buf[32]{};
+			const auto got = ::read(fd, buf, sizeof(buf) - 1);
+			::close(fd);
+
+			if (got > 0)
+			{
+				caps[core] = static_cast<u32>(std::atoi(buf));
+			}
+		}
+
+		return caps;
+	}();
+
+	return s_caps;
+}
+#endif
+
+void thread_ctrl::detect_cpu_layout()
+{
+	if (!g_native_core_layout.compare_and_swap_test(native_core_arrangement::undefined, native_core_arrangement::generic))
+		return;
+
+#if defined(ARCH_ARM64) && defined(__linux__)
+	// Heterogeneous if the kernel reports differing per-core capacity. Every
+	// big.LITTLE/DynamIQ SoC exposes cpu_capacity; a uniform machine reports the
+	// same value everywhere (or nothing at all), and falls through to generic.
+	{
+		const auto& caps = get_arm_core_capacities();
+		u32 lowest = umax, highest = 0;
+
+		for (u32 core = 0; core < 64u; core++)
+		{
+			if (caps[core])
+			{
+				lowest = std::min(lowest, caps[core]);
+				highest = std::max(highest, caps[core]);
+			}
+		}
+
+		if (highest && lowest != umax && highest > lowest)
+		{
+			sig_log.notice("Detected ARM heterogeneous CPU (capacity %u..%u)", lowest, highest);
+			g_native_core_layout.store(native_core_arrangement::arm_big_little);
+			return;
+		}
+	}
+#endif
+
+	const auto system_id = utils::get_cpu_brand();
+	if (system_id.find("Ryzen") != umax)
+	{
+		g_native_core_layout.store(native_core_arrangement::amd_ccx);
+	}
+	else if (system_id.find("Intel") != umax)
+	{
+#ifdef _WIN32
+		const LOGICAL_PROCESSOR_RELATIONSHIP relationship = LOGICAL_PROCESSOR_RELATIONSHIP::RelationProcessorCore;
+		DWORD buffer_size = 0;
+
+		// If buffer size is set to 0 bytes, it will be overwritten with the required size
+		if (GetLogicalProcessorInformationEx(relationship, nullptr, &buffer_size))
+		{
+			sig_log.error("GetLogicalProcessorInformationEx returned 0 bytes");
+			return;
+		}
+		DWORD error_code = GetLastError();
+		if (error_code != ERROR_INSUFFICIENT_BUFFER)
+		{
+			sig_log.error("Unexpected windows error code when detecting CPU layout: %u", error_code);
+			return;
+		}
+
+		std::vector<u8> buffer(buffer_size);
+
+		if (!GetLogicalProcessorInformationEx(relationship,
+			reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *>(buffer.data()), &buffer_size))
+		{
+			sig_log.error("GetLogicalProcessorInformationEx failed (size=%u, error=%s)", buffer_size, fmt::win_error{GetLastError(), nullptr});
+		}
+		else
+		{
+			// Iterate through the buffer until a core with hyperthreading is found
+			auto ptr = reinterpret_cast<uptr>(buffer.data());
+			const uptr end = ptr + buffer_size;
+
+			while (ptr < end)
+			{
+				auto info = reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *>(ptr);
+				if (info->Relationship == relationship && info->Processor.Flags == LTP_PC_SMT)
+				{
+					g_native_core_layout.store(native_core_arrangement::intel_ht);
+					break;
+				}
+				ptr += info->Size;
+			}
+		}
+#else
+		sig_log.todo("Thread scheduler is not implemented for Intel and this OS");
+#endif
+	}
+}
+
+u64 thread_ctrl::get_affinity_mask(thread_class group)
+{
+	detect_cpu_layout();
+
+	if (const auto thread_count = utils::get_thread_count())
+	{
+		const u64 all_cores_mask = process_affinity_mask;
+
+		switch (g_native_core_layout)
+		{
+		default:
+		case native_core_arrangement::generic:
+		{
+			return all_cores_mask;
+		}
+		case native_core_arrangement::arm_big_little:
+		{
+			// Put the threads that gate the frame -- SPU and RSX -- on the cores
+			// that can actually keep up, and leave the little cluster for PPU and
+			// helpers. Without this the OS spreads six SPU threads across a mix of
+			// big and LITTLE cores, and the slow ones set the pace.
+			const auto& caps = get_arm_core_capacities();
+			u64 fast_mask = 0;
+			u64 slow_mask = 0;
+			u32 threshold = 0;
+
+			for (u32 core = 0; core < 64u; core++)
+			{
+				threshold = std::max(threshold, caps[core]);
+			}
+
+			// Anything within 25% of the fastest core counts as "fast", so a
+			// mid cluster (A715/A710) joins the prime core rather than being
+			// lumped in with the A510s.
+			threshold = threshold * 3 / 4;
+
+			for (u32 core = 0; core < 64u; core++)
+			{
+				if (~process_affinity_mask & (u64{1} << core))
+				{
+					continue;
+				}
+
+				const u32 capacity = caps[core];
+
+				((capacity && capacity >= threshold) ? fast_mask : slow_mask) |= (u64{1} << core);
+			}
+
+			if (!fast_mask || !slow_mask)
+			{
+				// Degenerate reading -- do not fence anything off.
+				return all_cores_mask;
+			}
+
+			// Reserve the single fastest core for RSX where there is one to spare.
+			//
+			// RSX and all the SPU threads previously shared one mask, so on a 4+3+1 phone
+			// that was six hot threads over five cores. RSX is the thread the frame waits
+			// on: it was measured spending about 10ms per frame inside its own loop without
+			// running, not blocked on the GPU and not faulting, simply waiting for a core.
+			//
+			// Keeping the SPUs off the prime core leaves it for RSX without fencing RSX in,
+			// since RSX keeps the whole fast cluster and only loses the contention for the
+			// best core. Only applied when doing so still leaves the SPUs more than one
+			// core, otherwise they would be crowded worse than the problem being fixed.
+			u64 prime_mask = 0;
+			u32 best_capacity = 0;
+
+			for (u32 core = 0; core < 64u; core++)
+			{
+				if (~fast_mask & (u64{1} << core))
+				{
+					continue;
+				}
+
+				if (caps[core] > best_capacity)
+				{
+					best_capacity = caps[core];
+					prime_mask = (u64{1} << core);
+				}
+			}
+
+			const u64 spu_mask = (std::popcount(fast_mask & ~prime_mask) > 1)
+				? (fast_mask & ~prime_mask)
+				: fast_mask;
+
+			switch (group)
+			{
+			case thread_class::spu:
+				return spu_mask;
+			case thread_class::rsx:
+				return fast_mask;
+			case thread_class::ppu:
+				// PPU still needs a fast core for the main thread, but letting it
+				// spill to the little cluster keeps it out of the SPUs' way.
+				return all_cores_mask;
+			default:
+				return slow_mask;
+			}
+		}
+		case native_core_arrangement::amd_ccx:
+		{
+			if (thread_count <= 8)
+			{
+				// Single CCX or not enough threads, do nothing
+				return all_cores_mask;
+			}
+
+			u64 spu_mask, ppu_mask, rsx_mask;
+			spu_mask = ppu_mask = rsx_mask = all_cores_mask; // Fallback, in case someone is messing with core config
+
+			const auto system_id = utils::get_cpu_brand();
+			const auto family_id = utils::get_cpu_family();
+			const auto model_id = utils::get_cpu_model();
+
+			switch (family_id)
+			{
+			case 0x17: // Zen, Zen+, Zen2
+			case 0x18: // Dhyana core (Zen)
+			{
+				if (model_id > 0x30)
+				{
+					// Zen2 (models 49, 96, 113, 144)
+					// Much improved inter-CCX latency
+					switch (thread_count)
+					{
+					case 128:
+					case 64:
+					case 48:
+					case 32:
+						// TR 3000 series, or R9 3950X, Assign threads 9-32
+						ppu_mask = 0b11111111000000000000000000000000;
+						spu_mask = 0b00000000111111110000000000000000;
+						rsx_mask = 0b00000000000000001111111100000000;
+						break;
+					case 24:
+						// 3900X, Assign threads 7-24
+						ppu_mask = 0b111111000000000000000000;
+						spu_mask = 0b000000111111000000000000;
+						rsx_mask = 0b000000000000111111000000;
+						break;
+					case 16:
+						// 3700, 3800 family, Assign threads 1-16
+						ppu_mask = 0b0000000011110000;
+						spu_mask = 0b1111111100000000;
+						rsx_mask = 0b0000000000001111;
+						break;
+					case 12:
+						// 3600 family, Assign threads 1-12
+						ppu_mask = 0b000000111000;
+						spu_mask = 0b111111000000;
+						rsx_mask = 0b000000000111;
+						break;
+					default:
+						break;
+					}
+				}
+				else
+				{
+					// Zen, Zen+ (models 1, 8(+), 17, 24(+), 32)
+					switch (thread_count)
+					{
+					case 64:
+						// TR 2990WX, Assign threads 17-32
+						ppu_mask = 0b00000000111111110000000000000000;
+						spu_mask = ppu_mask;
+						rsx_mask = 0b11111111000000000000000000000000;
+						break;
+					case 48:
+						// TR 2970WX, Assign threads 9-24
+						ppu_mask = 0b000000111111000000000000;
+						spu_mask = ppu_mask;
+						rsx_mask = 0b111111000000000000000000;
+						break;
+					case 32:
+						// TR 2950X, TR 1950X, Assign threads 17-32
+						ppu_mask = 0b00000000111111110000000000000000;
+						spu_mask = ppu_mask;
+						rsx_mask = 0b11111111000000000000000000000000;
+						break;
+					case 24:
+						// TR 1920X, 2920X, Assign threads 13-24
+						ppu_mask = 0b000000111111000000000000;
+						spu_mask = ppu_mask;
+						rsx_mask = 0b111111000000000000000000;
+						break;
+					case 16:
+						// 1700, 1800, 2700, TR 1900X family
+						if (g_cfg.core.thread_scheduler == thread_scheduler_mode::alt)
+						{
+							ppu_mask = 0b0010000010000000;
+							spu_mask = 0b0000101010101010;
+							rsx_mask = 0b1000000000000000;
+						}
+						else // if (g_cfg.core.thread_scheduler == thread_scheduler_mode::old)
+						{
+							ppu_mask = 0b1111111100000000;
+							spu_mask = ppu_mask;
+							rsx_mask = 0b0000000000111100;
+						}
+						break;
+					case 12:
+						// 1600, 2600 family, Assign threads 3-12
+						ppu_mask = 0b111111000000;
+						spu_mask = ppu_mask;
+						rsx_mask = 0b000000111100;
+						break;
+					default:
+						break;
+					}
+				}
+				break;
+			}
+			case 0x19: // Zen3
+			{
+				// Single-CCX architecture, just disable SMT if wide enough
+				// CCX now holds upto 16 threads
+				// Lack of hw availability makes testing difficult
+				switch (thread_count)
+				{
+				case 24:
+					// 5900X, Use same scheduler as 3900X
+					// Unverified on windows, may be worse than just disabling SMT and scheduler
+					ppu_mask = 0b111111000000000000000000;
+					spu_mask = 0b000000111111000000000000;
+					rsx_mask = 0b000000000000111111000000;
+					break;
+				case 16:
+					// 5800X
+					if (g_cfg.core.thread_scheduler == thread_scheduler_mode::alt)
+					{
+						ppu_mask = 0b0000000011110000;
+						spu_mask = 0b1111111100000000;
+						rsx_mask = 0b0000000000001111;
+					}
+					else // if (g_cfg.core.thread_scheduler == thread_scheduler_mode::old)
+					{
+						// Verified by more than one windows user on 16-thread CPU
+						ppu_mask = spu_mask = rsx_mask = (0b10101010101010101010101010101010 & all_cores_mask);
+					}
+					break;
+				case 12:
+					// 5600X
+					if (g_cfg.core.thread_scheduler == thread_scheduler_mode::alt)
+					{
+						ppu_mask = 0b000000001100;
+						spu_mask = 0b111111110000;
+						rsx_mask = 0b000000000011;
+					}
+					else // if (g_cfg.core.thread_scheduler == thread_scheduler_mode::old)
+					{
+						ppu_mask = spu_mask = rsx_mask = all_cores_mask;
+					}
+					break;
+				default:
+					if (thread_count > 24)
+					{
+						ppu_mask = spu_mask = rsx_mask = (0b10101010101010101010101010101010 & all_cores_mask);
+					}
+					break;
+				}
+				break;
+			}
+			default:
+			{
+				break;
+			}
+			}
+
+			switch (group)
+			{
+			default:
+			case thread_class::general:
+				return all_cores_mask;
+			case thread_class::rsx:
+				return rsx_mask;
+			case thread_class::ppu:
+				return ppu_mask;
+			case thread_class::spu:
+				return spu_mask;
+			}
+		}
+		case native_core_arrangement::intel_ht:
+		{
+			if (thread_count >= 12 && g_cfg.core.thread_scheduler == thread_scheduler_mode::alt)
+				return (0b10101010101010101010101010101010 & all_cores_mask); // Potentially improves performance by mimicking HT off
+			return all_cores_mask;
+		}
+		}
+	}
+
+	return -1;
+}
+
+void thread_ctrl::set_native_priority(int priority)
+{
+#ifdef _WIN32
+	HANDLE _this_thread = GetCurrentThread();
+	INT native_priority = THREAD_PRIORITY_NORMAL;
+
+	if (priority > 0)
+		native_priority = THREAD_PRIORITY_ABOVE_NORMAL;
+	if (priority < 0)
+		native_priority = THREAD_PRIORITY_BELOW_NORMAL;
+
+	if (!SetThreadPriority(_this_thread, native_priority))
+	{
+		sig_log.error("SetThreadPriority() failed: %s", fmt::win_error{GetLastError(), nullptr});
+	}
+#elif defined(__ANDROID__)
+	// Nice value, not sched_priority.
+	//
+	// Android threads run under SCHED_OTHER, where sched_priority must be 0 and
+	// sched_get_priority_max returns 0, so the pthread_setschedparam path below sets
+	// nothing at all. The RSX thread asks for a boost on startup and was still measured at
+	// nice 0, being involuntarily preempted about 5300 times a second, roughly 130 times
+	// per frame, by the PPU, SPU and audio threads sharing its cores.
+	//
+	// Under SCHED_OTHER the scheduler's weighting comes from nice, which setpriority does
+	// set. Android grants apps enough RLIMIT_NICE headroom to go negative for their own
+	// threads, which is how audio threads get their priority.
+	//
+	// Modest values on purpose: this is a hint to be scheduled ahead of the other emulator
+	// threads, not a bid to starve them, and the RSX thread is the one everything else
+	// waits on.
+	const int nice_value = (priority > 0) ? -8 : (priority < 0 ? 8 : 0);
+
+	errno = 0;
+	if (setpriority(PRIO_PROCESS, static_cast<id_t>(gettid()), nice_value) == -1 && errno)
+	{
+		// Not fatal. Without the headroom the thread simply keeps its default weighting.
+		sig_log.warning("setpriority(%d) failed: %s", nice_value, strerror(errno));
+	}
+#else
+	int policy;
+	struct sched_param param;
+
+	pthread_getschedparam(pthread_self(), &policy, &param);
+
+	if (priority > 0)
+		param.sched_priority = sched_get_priority_max(policy);
+	if (priority < 0)
+		param.sched_priority = sched_get_priority_min(policy);
+
+	if (int err = pthread_setschedparam(pthread_self(), policy, &param))
+	{
+		sig_log.error("pthread_setschedparam() failed: %d", err);
+	}
+#endif
+}
+
+u64 thread_ctrl::get_process_affinity_mask()
+{
+	static const u64 mask = []() -> u64
+	{
+#ifdef _WIN32
+		DWORD_PTR res, _sys;
+		if (!GetProcessAffinityMask(GetCurrentProcess(), &res, &_sys))
+		{
+			sig_log.error("Failed to get process affinity mask.");
+			return 0;
+		}
+
+		return res;
+#else
+		// Assume it's called from the main thread (this is a bit shaky)
+		return thread_ctrl::get_thread_affinity_mask();
+#endif
+	}();
+
+	return mask;
+}
+
+DECLARE(thread_ctrl::process_affinity_mask) = get_process_affinity_mask();
+
+void thread_ctrl::set_thread_affinity_mask(u64 mask)
+{
+	sig_log.trace("set_thread_affinity_mask called with mask=0x%x", mask);
+
+#ifdef _WIN32
+	HANDLE _this_thread = GetCurrentThread();
+	if (!SetThreadAffinityMask(_this_thread, !mask ? process_affinity_mask : mask))
+	{
+		sig_log.error("Failed to set thread affinity 0x%x: error: %s", mask, fmt::win_error{GetLastError(), nullptr});
+	}
+#elif __APPLE__
+	// Supports only one core
+	thread_affinity_policy_data_t policy = { static_cast<integer_t>(std::countr_zero(mask)) };
+	thread_port_t mach_thread = pthread_mach_thread_np(pthread_self());
+	thread_policy_set(mach_thread, THREAD_AFFINITY_POLICY, reinterpret_cast<thread_policy_t>(&policy), !mask ? 0 : 1);
+// NOTE: Android was excluded here upstream, which made every affinity request a
+// silent no-op -- Thread Scheduler Mode looked settable but did nothing. bionic
+// provides pthread_setaffinity_np, and RPCSX runs this path on Android without
+// the carve-out. Failures are already logged rather than fatal.
+#elif (defined(__linux__) || defined(__DragonFly__) || defined(__FreeBSD__))
+	if (!mask)
+	{
+		// Reset affinity mask
+		mask = process_affinity_mask;
+	}
+
+	cpu_set_t cs;
+	CPU_ZERO(&cs);
+
+	for (u32 core = 0; core < 64u; ++core)
+	{
+		const u64 shifted = mask >> core;
+
+		if (shifted & 1)
+		{
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wold-style-cast"
+			CPU_SET(core, &cs);
+#pragma GCC diagnostic pop
+		}
+
+		if (shifted <= 1)
+		{
+			break;
+		}
+	}
+
+#ifdef ANDROID
+	// bionic has no pthread_setaffinity_np. sched_setaffinity with pid 0 targets
+	// the calling THREAD on Linux, which is what we want.
+	if (sched_setaffinity(0, sizeof(cpu_set_t), &cs) != 0)
+	{
+		sig_log.error("Failed to set thread affinity 0x%x: errno %d.", mask, errno);
+	}
+#else
+	if (int err = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cs))
+	{
+		sig_log.error("Failed to set thread affinity 0x%x: error %d.", mask, err);
+	}
+#endif
+#endif
+}
+
+u64 thread_ctrl::get_thread_affinity_mask()
+{
+#ifdef _WIN32
+	const u64 res = process_affinity_mask;
+
+	if (DWORD_PTR result = SetThreadAffinityMask(GetCurrentThread(), res))
+	{
+		if (res != result)
+		{
+			SetThreadAffinityMask(GetCurrentThread(), result);
+		}
+
+		return result;
+	}
+
+	sig_log.error("Failed to get thread affinity mask.");
+	return 0;
+#elif !defined(ANDROID) && (defined(__linux__) || defined(__DragonFly__) || defined(__FreeBSD__))
+	cpu_set_t cs;
+	CPU_ZERO(&cs);
+
+	if (int err = pthread_getaffinity_np(pthread_self(), sizeof(cpu_set_t), &cs))
+	{
+		sig_log.error("Failed to get thread affinity mask: error %d.", err);
+		return 0;
+	}
+
+	u64 result = 0;
+
+	for (u32 core = 0; core < 64u; core++)
+	{
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wold-style-cast"
+		if (CPU_ISSET(core, &cs))
+#pragma GCC diagnostic pop
+		{
+			result |= 1ull << core;
+		}
+	}
+
+	if (result == 0)
+	{
+		sig_log.error("Thread affinity mask is out of u64 range.");
+		return 0;
+	}
+
+	return result;
+#else
+	return -1;
+#endif
+}
+
+std::pair<void*, usz> thread_ctrl::get_thread_stack()
+{
+#ifdef _WIN32
+	ULONG_PTR _min = 0;
+	ULONG_PTR _max = 0;
+	GetCurrentThreadStackLimits(&_min, &_max);
+	const usz ssize = _max - _min;
+	const auto saddr = reinterpret_cast<void*>(_min);
+#else
+	void* saddr = 0;
+	usz ssize = 0;
+#if defined(__linux__)
+	pthread_attr_t attr;
+	pthread_getattr_np(pthread_self(), &attr);
+	pthread_attr_getstack(&attr, &saddr, &ssize);
+#elif defined(__APPLE__)
+	saddr = pthread_get_stackaddr_np(pthread_self());
+	ssize = pthread_get_stacksize_np(pthread_self());
+#else
+	pthread_attr_t attr;
+	pthread_attr_get_np(pthread_self(), &attr);
+	pthread_attr_getstackaddr(&attr, &saddr);
+	pthread_attr_getstacksize(&attr, &ssize);
+#endif
+#endif
+	return {saddr, ssize};
+}
+
+u64 thread_ctrl::get_tid()
+{
+	static thread_local u64 s_tls_tid = []() -> u64
+	{
+	#ifdef _WIN32
+		return GetCurrentThreadId();
+	#elif defined(ANDROID)
+		return pthread_gettid_np(pthread_self());
+	#elif defined(__linux__)
+		return syscall(SYS_gettid);
+	#elif defined(__APPLE__)
+		u64 tid{};
+		pthread_threadid_np(nullptr, &tid);
+		return tid;
+	#elif defined(__FreeBSD__)
+		return pthread_getthreadid_np();
+	#else
+		return static_cast<u64>(pthread_self());
+	#endif
+	}();
+
+	return s_tls_tid;
+}
+
+bool thread_ctrl::is_main()
+{
+	return get_tid() == utils::main_tid;
+}
+
+usz map_workload(std::string_view thread_name, usz thread_count, usz count, std::function<void(usz)>&& func)
+{
+	ensure(!!func);
+
+	if (thread_count <= 1)
+	{
+		for (usz i = 0; i < count; i++)
+		{
+			func(i);
+		}
+		return 1;
+	}
+
+	atomic_t<u32> num_threads_succeeded {0}; // Check if any thread didn't finish. For example when hitting an exception.
+
+	atomic_t<usz> indexer = 0;
+	const auto iterate = [count, &func, &indexer]()
+	{
+		while (thread_ctrl::state() != thread_state::aborting)
+		{
+			// Make sure indexer does not exceed count
+			const usz index = indexer.fetch_op([count](usz& v)
+			{
+				if (v < count)
+				{
+					v++;
+					return true;
+				}
+
+				return false;
+			}).first;
+
+			if (index >= count)
+			{
+				break;
+			}
+
+			func(index);
+		}
+	};
+	named_thread_group workers(thread_name, ::narrow<u32>(thread_count) - 1, [&iterate, &num_threads_succeeded]()
+	{
+		iterate();
+		num_threads_succeeded++;
+	});
+
+	iterate();
+
+	workers.join();
+
+	return num_threads_succeeded + 1;
+}
+
+usz map_workload(std::string_view thread_name, usz thread_count, std::function<void()>&& func)
+{
+	ensure(!!func);
+
+	if (thread_count <= 1)
+	{
+		func();
+		return 1;
+	}
+
+	atomic_t<u32> num_threads_succeeded {0}; // Check if any thread didn't finish. For example when hitting an exception.
+
+	named_thread_group workers(thread_name, ::narrow<u32>(thread_count) - 1, [&func, &num_threads_succeeded]()
+	{
+		func();
+		num_threads_succeeded++;
+	});
+
+	func();
+
+	workers.join();
+
+	return num_threads_succeeded + 1;
+}

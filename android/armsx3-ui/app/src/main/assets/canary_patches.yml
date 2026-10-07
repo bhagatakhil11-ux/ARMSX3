@@ -1,0 +1,434 @@
+Version: 1.2
+
+# Canary patches bundled with ARMSX3.
+#
+# RPCS3's official feed (rpcs3.net/compatibility?patch&api=v1&v=1.2) does not carry
+# these. They live on the RPCS3 wiki as "canary" patches that a desktop user adds by
+# hand through the Patch Manager's import button -- a step there is no equivalent of
+# on Android, so without bundling them the affected games are simply broken for us.
+#
+# Only patches that fix a game which is otherwise unplayable belong here. This is not
+# a place for 60fps unlocks or resolution mods: those are the online database's job,
+# and shipping them would fork a database we would then have to maintain.
+#
+# Ps3PatchRepo.BUNDLED must list every patch here, or it is imported but never enabled.
+
+# SONIC THE HEDGEHOG (2006) -- upstream RPCS3 issue #4122, open since 2018.
+#
+# A PPU/SPU race: an SNR (signal notification register) is overwritten while still
+# non-empty, so the SPU jobs that feed geometry lose their signal and whole draw
+# batches never render. The game shows the HUD and the skybox and flickers everything
+# else in and out of existence. Desktop RPCS3 behaves identically without this patch.
+#
+# Hooks RPCS3_HLE_LIBRARY:WaitForSPUsToEmptySNRs, which is in the core at
+# rpcs3/Emu/Cell/Modules/HLE_PATCHES.cpp and exists solely to serve this patch.
+#
+# ARM64 needs three upstream fixes for this to work rather than crash, all present in
+# this tree: PR #16022 (calloc code-cave blocks registered in ppu_patch_block_registry_t),
+# the is_faux_function guard in AArch64JIT.cpp that stops the tail-call return trap from
+# firing on a patch-point, and PR #17526 (PPU LLVM filters functions carrying patches).
+#
+# Keyed by PPU hash, so it applies only to the dump it was built for -- other regions
+# and revisions (BLES00028, v01.00) need their own entry with their own hash.
+PPU-4b46d0161ca657ab16b0a779d9062810ea5ea2dd:
+  Graphics Fix:
+    Games:
+      "SONIC THE HEDGEHOG":
+        BLUS30008:
+          # Quoted deliberately. The official database writes these bare (- 01.00) and
+          # yaml-cpp is fine with that because it hands back the raw scalar text, but a
+          # bare 01.01 is a float to most YAML readers and round-trips as "1.01". This
+          # key is compared against PARAM.SFO's VERSION at apply time, so if it ever
+          # became 1.01 the patch would silently stop matching the disc.
+          - "01.01"
+    Author: elad335
+    Patch Version: 1.0
+    Notes: Fixes missing graphics ingame.
+    Patch:
+      - [ calloc, 0x00f07714, 0x04 ]
+      - [ be32, 0x00000000, 0x38800003 ] # li r4, 3
+      - [ jumpf, 0x00000000, "RPCS3_HLE_LIBRARY:WaitForSPUsToEmptySNRs" ] # Args: (SPU ID, 3)
+      - [ be32, 0x00000000, 0x38800000 ] # li r4, 0
+      - [ be32, 0x00000000, 0x44000002 ] # sc
+
+# Tom Clancy's H.A.W.X. 2 (BLES00928) -- boot hang at the first intro video.
+#
+# The SPU dies with "Access violation reading location 0x20" in CellSpursKernel0 and
+# is parked forever (dbg_pause, which nothing in the Android build can clear), so the
+# emulator looks healthy at a locked 30 fps while the guest is dead. Upstream RPCS3
+# lists the title as Loadable with no fix but "delete data/movies".
+#
+# The title looks up a section named '.reload' in this SPU module. The module is
+# stripped -- e_shnum = 0 -- so the lookup can never succeed, on hardware either, and
+# the game is built to cope: the failure path writes 0 to the work descriptor's +0x10
+# field, and this very module tests that field to skip the overlay load:
+#
+#   03224  lqr r8,0x1b810     ; r8 = desc[+0x10]
+#   0322c  brz r8,0x32cc      ; == 0 -> skip
+#
+# A bump allocator on the PPU side then runs over the field unconditionally --
+# (0 - 0x10) & ~0xF = 0xfffffff0 -- destroying the sentinel. The guard no longer
+# fires, so the SPU issues GET lsa=0 ea=0 size=0x4000, a transfer that would have
+# overwritten the running SPURS kernel had it succeeded.
+#
+# This makes the overlay routine at LS 0x3208 return immediately, which is what the
+# surviving guard would have caused anyway. Safe because the section it needs cannot
+# exist in a stripped module. Suppressing the DMA instead does NOT work: the guest
+# loop waits on data that never arrives and runs away.
+#
+# Ps3PatchRepo.BUNDLED must list this, or it is imported but never enabled.
+
+SPU-42bae8e5d6a9304068ba1c6bbfdc18d656e287a1:
+  Bink overlay skip:
+    Games:
+      "Tom Clancy's H.A.W.X. 2":
+        BLES00928:
+          - "All"
+    Author: Zulux91
+    Patch Version: 1.0
+    Notes: Fixes the boot hang at the first intro video.
+    Patch:
+      # LS 0x3208 is the first instruction of the overlay routine (il r5,0).
+      # Offsets are LS addresses: apply_modification subtracts p_vaddr (0x3000).
+      - [ be32, 0x3208, 0x35000000 ] # bi lr -- return immediately
+
+# RATCHET & CLANK FUTURE: A CRACK IN TIME -- hangs starting a New Game.
+#
+# The engine waits for the RSX to drain its command ring, but reads GET once before
+# the loop rather than inside it:
+#
+#       lwz  r29,4(r12)        ; GET, read ONCE
+#   0x5cb1bc:
+#       lwz  r9,0(r11)         ; PUT
+#       cmpw cr6,r9,r29
+#       bne  cr6,0x5cb1bc      ; branches back AFTER the read
+#
+# That only terminates if GET has already reached PUT at the instant it is sampled.
+# On hardware the RSX has essentially always caught up by then, so the loop exits
+# immediately. Catch it one command short and it compares PUT against a value GET has
+# since moved past, and it spins forever.
+#
+# Captured with the stall watchdog: PUT = GET = 0x161af6c with the snapshot holding
+# 0x161af64, unchanged across eight samples 40 seconds apart, every other guest thread
+# blocked and the ring drained. The game does its own FIFO management -- it imports no
+# cellGcmFlush or cellGcmFinish -- so there is no HLE call to fix this behind.
+#
+# Moving the branch target back one instruction re-reads GET each pass, which is what
+# the loop means. It exits as soon as GET reaches PUT, and is a no-op in every case
+# where the original would already have exited, so it cannot change a working boot.
+#
+# Ps3PatchRepo.BUNDLED must list this, or it is imported but never enabled.
+
+# RATCHET & CLANK, the whole family. Every one of these games freezes without its fix, and
+# the fixes are Juhn's, from the community patch database -- reproduced here so a fresh
+# install is not one download away from a game that hangs. Ps3PatchRepo.BUNDLED must list
+# every (hash, name, serial) below or the patch is imported and never enabled.
+#
+# A Crack in Time (BCUS98124) REPLACES an ARMSX3 patch of our own, "FIFO drain wait fix",
+# which wrote the same word at 0x005cb1c4 with 0x409AFFF4 against Juhn's 0x409EFFF4. Both
+# retarget the branch to -12; ours also moved the condition from cr7 to cr6, which is one
+# bit of a guess against a fix the whole RPCS3 community runs. They cannot coexist -- in a
+# tester's log both applied to the same instruction and the last one won -- so ours is
+# retired rather than left to race.
+
+PPU-c4e26433d1eed9166eb0c67b6f66b2268f3704e2:
+  "Freeze Fix":
+    Games:
+      "Ratchet & Clank Future: Tools of Destruction":
+        BCES00052: [ All ]
+    Author: "Juhn"
+    Notes: "Fixes game crashes/freezes."
+    Patch Version: 1.2
+    Patch:
+      - [ be32, 0x005056f0, 0x409efff0 ]
+
+PPU-ec77eaf73a4f55d1c4ece532c3be6db0011e49ca:
+  "Freeze Fix":
+    Games:
+      "Ratchet & Clank Future: Tools of Destruction":
+        NPEA00452: [ All ]
+    Author: "Juhn"
+    Notes: "Fixes game crashes/freezes."
+    Patch Version: 1.2
+    Patch:
+      - [ be32, 0x00539ee8, 0x409efff4 ]
+
+PPU-f67f3e99077ba256728ffa16800c75e006661158: # 1.00 game version
+  "Freeze Fix":
+    Games:
+      "Ratchet & Clank Future: Tools of Destruction (1.0)":
+        BCUS98127: [ 01.00 ]
+    Author: "Juhn, Alexis"
+    Notes: "Fixes game crashes/freezes."
+    Patch Version: 1.2
+    Patch:
+      - [ be32, 0x005056d0, 0x409efff0 ]
+
+PPU-c14042df6304d3e420a9917e6f8e5fc05cc38b4c: # 2.00 game version
+  "Freeze Fix":
+    Games:
+      "Ratchet & Clank Future: Tools of Destruction (2.0)":
+        BCUS98127: [ 01.00 ]
+    Author: "Juhn, Epicalman"
+    Notes: "Fixes game crashes/freezes."
+    Patch Version: 1.2
+    Patch:
+      - [ be32, 0x00505948, 0x409efff0 ]
+
+PPU-16506d9d5bf692d615645accd24bca1ee1f8f9a6:
+  "Freeze Fix":
+    Games:
+      "Ratchet & Clank Future: Tools of Destruction":
+        NPUA80965: [ All ]
+    Author: "Juhn, Epicalman"
+    Notes: "Fixes game crashes/freezes."
+    Patch Version: 1.2
+    Patch:
+      - [ be32, 0x0053a208, 0x409efff4 ]
+
+PPU-4c819c69904784a56685c31df12f5d492bc0ed64:
+  "Freeze Fix":
+    Games:
+      "Ratchet & Clank: All 4 One":
+        BCAS20200: [ 01.03 ]
+        BCES01141: [ 01.03 ]
+        BCES01142: [ 01.03 ]
+        BCUS98175: [ 01.03 ]
+    Author: "Juhn, Hasster"
+    Notes: "Fixes game crashes/freezes"
+    Patch Version: 1.0
+    Patch:
+      - [ be32, 0x006910f8, 0x4082fff4 ]
+      - [ be32, 0x006910fc, 0x42800018 ]
+
+PPU-ed460e668a491f5e39f6547f3a24c2f20e2cb39b:
+  "Freeze fix":
+    Games:
+      "Ratchet & Clank: Nexus":
+        BCES01908: [ 01.00 ]
+        BCES01949: [ 01.00 ]
+    Author: "Juhn, Joenn"
+    Notes: "Fixes game crashes/freezes."
+    Patch Version: 1.0
+    Patch:
+      - [ be32, 0x005f7128, 0x4082fff4 ]
+
+PPU-fadb0af6fb7bd0113e88fb9af3eb78fe3be05d08:
+  "Freeze fix":
+    Games:
+      "Ratchet & Clank: Into the Nexus":
+        BCUS99245: [ 01.01 ]
+        NPUA80908: [ 01.01 ]
+      "Ratchet & Clank: Nexus":
+        BCES01908: [ 01.01 ]
+        BCES01949: [ 01.01 ]
+        NPEA00457: [ 01.01 ]
+    Author: "Juhn"
+    Notes: "Fixes game crashes/freezes."
+    Patch Version: 1.0
+    Patch:
+      - [ be32, 0x005f8ca8, 0x4082fff4 ]
+
+PPU-f07f7086588a4ea86a28bd768f0cbe710f5b813b:
+  "Freeze Fix":
+    Games:
+      "Ratchet & Clank Future: Quest for Booty":
+        BCAS20052: [ All ]
+        BCES00301: [ All ]
+        NPEA00088: [ All ]
+        NPEA00106: [ All ]
+    Author: "Juhn"
+    Notes: "Fixes game crashes/freezes."
+    Patch Version: 1.2
+    Patch:
+      - [ be32, 0x003eb8b0, 0x409efff0 ]
+
+PPU-1d9e99e1f091cfbdf1714d04e690d9cd816e2971:
+  "Freeze Fix":
+    Games:
+      "Ratchet & Clank Future: Quest for Booty":
+        NPUA80145: [ All ]
+    Author: "Juhn"
+    Notes: "Fixes game crashes/freezes."
+    Patch Version: 1.2
+    Patch:
+      - [ be32, 0x003eb730, 0x409efff0 ]
+
+PPU-0997e35d2b6738f5cecfda1d76380acca0828365:
+  "Freeze Fix":
+    Games:
+      "Ratchet & Clank Future: A Crack in Time":
+        BCUS98124: [ 01.00 ]
+    Author: "Juhn, Jonathan44062"
+    Notes: "Fixes game crashes/freezes."
+    Patch Version: 1.2
+    Patch:
+      - [ be32, 0x005cb1c4, 0x409efff4 ]
+
+# Unlike the entries above, this one IS in the official feed -- it is bundled anyway
+# because it has to default to ON, and a fresh install that has never downloaded the
+# database would otherwise not have it at all. Merging is by hash + name, so it
+# collapses onto the official entry once that database is fetched.
+#
+# This is the PPU "Disable MLAA", NOT the generic "Disable SPU MLAA". The address is
+# specific to BLUS30736 v01.00 -- do not widen the version list.
+PPU-aa798f32a1fda1c23a20066edb1c623c486d53cc:
+  "Disable MLAA":
+    Games:
+      "SoulCalibur V":
+        BLUS30736: [ 01.00 ]
+    Author: "illusion"
+    Notes: "Disables the game's morphological AA pass. Without it the title sits at ~1 fps and wedges."
+    Patch Version: 1.0
+    Patch:
+      - [ be32, 0x00304770, 0x38000001 ]
+
+# BURNOUT PARADISE, BLUS30061 v01.00 -- ours, not from the community database.
+#
+# The game hangs the audio thread on a null buffer a few seconds after the junkyard
+# interstitial in the intro, every run, on every device and build tried.
+#
+# Two independent faults, both from the same root. The routine that refills an audio voice
+# asks the heap for a buffer of the size at r31+0x17c. That word is written at 0x6317a8 as
+# the low 32 bits of an fctidz conversion and comes out 0x6387194f, about 1.67GB, where every
+# other voice buffer in the same table is 0x900. The heap walks its free list, finds nothing
+# that large and correctly returns null, and the game stores that null without checking it.
+# Clamping the request to 0x7fff, which the allocator rounds to 32KB, is enough: the only
+# copy ever observed into that buffer is 0x7ff8 bytes at offset 4.
+#
+# Past that, a lookup at 0x45df68 returns null when it finds nothing, and the caller checks
+# for null and then branches to code that dereferences it anyway. That path cannot run on real
+# hardware because the lookup always finds something there. It is retargeted to 0x45e468, the
+# skip target the very next instruction already uses.
+#
+# The remaining three writes are a guard: if the allocation fails anyway, return instead of
+# storing a null. Safe because r9 == r29 in every dump taken, so the r9 rebuild they replace
+# is dead, and 0x458c2c is the function's own epilogue.
+#
+# Verified on an Odin 3: deterministic crash before, and after it reaches the open world with
+# zero access violations. The float arithmetic is NOT at fault here and was measured, not
+# assumed: fmuls and fctidz are both byte-exact against real hardware, and every integer suite
+# passes, so the bad value arrives already wrong.
+PPU-56101fbdbac186fddef72207145015fd314a0be5:
+  "ARMSX3 Junkyard crash fix":
+    Games:
+      "Burnout Paradise":
+        BLUS30061: [ 01.00 ]
+    Author: "jpolo1224"
+    Notes: "Fixes the crash at the junkyard in the intro."
+    Patch Version: 1.0
+    Patch:
+      - [ be32, 0x00459028, 0x38807fff ]
+      - [ be32, 0x0045e304, 0x41920164 ]
+      - [ be32, 0x00459040, 0x2f030000 ]
+      - [ be32, 0x0045904c, 0x419afbe0 ]
+      - [ be32, 0x00459054, 0x60000000 ]
+      - [ be32, 0x0045905c, 0x60000000 ]
+      - [ be32, 0x00459064, 0x90690010 ]
+
+# NBA 08, BCES00112 v01.00 -- ours, not from the community database.
+#
+# "The PS3 application has likely crashed" during the intro movies, on a first run while
+# the SPU cache is still compiling. The game's CellVdec callback at 0x3eacb4 handles a
+# PICOUT message by calling cellVdecGetPicItem and reading item->0x44 at 0x3ead3c, checking
+# neither the return code nor the item. In the crash log GetPicItem returned
+# CELL_VDEC_ERROR_SEQ with a null item: the decoder, stalled on SPU compiles while the game
+# was tearing the movie player down, delivered its PICOUT late. With a warm cache the intro
+# played through, so this is a race the game never guarded against.
+#
+# The cave redoes the load that the branch into it replaced, and when the item is null it
+# takes the callback's own return-0 exit at 0x3ead0c, which drops that one picture. cr6 is
+# free there: the bl just before clobbers every volatile field, and nothing after reads cr6.
+# Nothing branches to 0x3ead38, which matters on ARM64: a cave whose entry point is also a
+# branch target takes the whole app down in ppu_far_jump.
+#
+# The quickplay loading screen that never ends is a second race, and it only exists because we
+# load faster than a PS3. UI/Loading_New.bgf is an Anark scene driven by the disc's Lua: its
+# Intro slide (6.5 s) plays straight through into a Looping slide, and the game sends
+# "onExitNextLoop" exactly once when loading is done. Read from the heap at the hang: the Intro
+# behaviour received it (shouldExit true) but never saw its own slide stop, since the slide
+# advances by itself, while the Loop behaviour, which only registers when its slide starts, never
+# got it and replays the tip forever. A PS3 always takes longer than 6.5 s to load a match; we
+# take about 4. The loading thread (0x2236c) now keeps its end request pending and re-sends the
+# event every frame until the scene answers with onEndPresentation, and clears the request on
+# both of its exits so the next loading screen starts clean.
+PPU-30ce8c9f0a9552914275c90e2980749630f3ea18:
+  "ARMSX3 intro movie crash fix":
+    Games:
+      "NBA 08":
+        BCES00112: [ 01.00 ]
+    Author: "jpolo1224"
+    Notes: "Fixes a crash during the intro movies on the first run."
+    Patch Version: 1.0
+    Patch:
+      - [ calloc, 0x003ead38, 0x04 ]
+      - [ be32, 0x00000000, 0x80810070 ] # lwz r4,0x70(r1), the instruction the branch replaced
+      - [ be32, 0x00000000, 0x2f040000 ] # cmpwi cr6,r4,0
+      - [ be32, 0x00000000, 0x409a0008 ] # bne cr6,+8
+      - [ jump, 0x00000000, 0x003ead0c ] # null item: li r3,0 and return
+  "ARMSX3 quickplay loading fix":
+    Games:
+      "NBA 08":
+        BCES00112: [ 01.00 ]
+    Author: "jpolo1224"
+    Notes: "Fixes the loading screen that never ends before a quickplay game."
+    Patch Version: 1.0
+    Patch:
+      - [ be32, 0x0002245c, 0x409e0144 ] # bne cr7,0x225a0: a pending request goes straight to the send, no print
+      - [ be32, 0x000225a4, 0x60000000 ] # keep the request pending (was stb r28,0x37(r31))
+      - [ be32, 0x000225dc, 0x4bfffe84 ] # b 0x22460: check for onEndPresentation after each send
+      - [ be32, 0x000225ec, 0x9b9f0037 ] # stb r28,0x37(r31): the scene is done, clear the request
+      - [ be32, 0x000225f4, 0x9b9f0038 ] # stb r28,0x38(r31): clear the done flag (r29 is now 1)
+      - [ be32, 0x00022504, 0x9b9f0037 ] # stb r28,0x37(r31): a forced exit clears the request too
+
+# GRAN TURISMO 6 v01.22 (BCUS99247, BCUS98296) -- illusion's patches, brought to ARMSX3 by
+# mlgprorektm8, who confirmed them on the North American and Latin American releases.
+#
+# Disable MLAA: the game reads every frame back for its MLAA pass, so it only renders correctly
+# with Write and Read Color Buffers on, and those cost a lot of frame time. The patch turns MLAA
+# off, and the core then switches both buffer settings off for the run, since nothing needs them
+# any more (patch_engine::apply, Utilities/bin_patch.cpp).
+# Disable Motion Blur: without it replays and track intros render black.
+#
+# Keyed by PPU hash, so they apply only to these two v01.22 executables. RPCS3's database knows a
+# different v01.22 executable for BCUS98296 (PPU-6ac472e1...): these patches do not touch it, and
+# neither do the buffer settings, which stay whatever that game's configuration says.
+PPU-42367707f4caac2668f10cb46498f64bde9db440:
+  "Disable MLAA":
+    Games:
+      "Gran Turismo 6":
+        BCUS99247: [ 01.22 ]
+    Author: "illusion"
+    Notes: "Turns off the game's MLAA pass, which needed Write and Read Color Buffers. ARMSX3 turns both off while this patch is on."
+    Patch Version: 1.0
+    Patch:
+      - [ be32, 0x00ED2E88, 0x39E00001 ]
+  "Disable Motion Blur":
+    Games:
+      "Gran Turismo 6":
+        BCUS99247: [ 01.22 ]
+    Author: "illusion"
+    Notes: "Fixes the black screen in replays and track intros."
+    Patch Version: 1.0
+    Patch:
+      - [ be32, 0x008C2B4C, 0x38600000 ]
+
+PPU-4f1e9acd7d98961b4b742fb324a2faba6212ea67:
+  "Disable MLAA":
+    Games:
+      "Gran Turismo 6":
+        BCUS98296: [ 01.22 ]
+    Author: "illusion"
+    Notes: "Turns off the game's MLAA pass, which needed Write and Read Color Buffers. ARMSX3 turns both off while this patch is on."
+    Patch Version: 1.0
+    Patch:
+      - [ be32, 0x00ED2E88, 0x39E00001 ]
+  "Disable Motion Blur":
+    Games:
+      "Gran Turismo 6":
+        BCUS98296: [ 01.22 ]
+    Author: "illusion"
+    Notes: "Fixes the black screen in replays and track intros."
+    Patch Version: 1.0
+    Patch:
+      - [ be32, 0x008C2B4C, 0x38600000 ]

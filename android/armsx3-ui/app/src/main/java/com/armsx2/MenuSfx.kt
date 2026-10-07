@@ -1,0 +1,362 @@
+package com.armsx2
+
+import android.content.Context
+import android.media.AudioAttributes
+import android.media.SoundPool
+import android.net.Uri
+import android.os.SystemClock
+import android.util.Log
+import androidx.annotation.Keep
+import androidx.compose.runtime.mutableStateOf
+import androidx.core.content.edit
+import androidx.documentfile.provider.DocumentFile
+import com.armsx2.runtime.MainActivityRuntime
+import java.io.File
+
+/**
+ * UI sound effects for the library/menu — the "console dashboard" blips (select, back, toggle…).
+ *
+ * Ships a bundled default set: short interface blips trimmed from obsydianx's "Interface SFX Pack
+ * 1", released CC0 / public domain (https://obsydianx.itch.io/interface-sfx-pack-1). CC0 imposes no
+ * attribution requirement, but we credit it in the About screen anyway.
+ *
+ * Each event can be OVERRIDDEN by importing a folder of named clips (see [Event.fileName]): a user
+ * file wins over the built-in for that event, everything else keeps the default. Imported files are
+ * copied into app-private storage (no persisted SAF grant needed) — nothing is redistributed, same
+ * model as importing a texture pack, a skin, or a music track.
+ *
+ * Playback is a SoundPool for near-zero-latency, overlap-friendly one-shots, kept OFF the emulator's
+ * Oboe/SPU2 path (its own USAGE_GAME attributes) so it never contends with SPU2 output (cf. the
+ * LibraryMusic note on Android reclaiming Oboe, #333).
+ */
+object MenuSfx {
+    private const val TAG = "MenuSfx"
+    private const val EnabledKey = "ui.menuSfx"
+    private const val VolumeKey = "ui.menuSfx.volume"
+    private const val PackNameKey = "ui.menuSfx.packName"
+    // 15% by default — these fire on every interaction, so they should sit well under the UI (same
+    // reasoning as LibraryMusic's default). Applies to fresh installs; existing users keep their set value.
+    private const val DefaultVolumePercent = 15
+
+    /** UI events a sound binds to. [fileName] is the base name to use when importing a custom pack
+     *  (case- and extension-insensitive); [defaultRes] is the bundled fallback clip. */
+    enum class Event(val fileName: String, val defaultRes: Int, val altRes: Int = 0) {
+        NAV("nav", R.raw.sfx_nav_a, R.raw.sfx_nav_b), // alternates two soft ticks as the highlight moves
+        SELECT("select", R.raw.sfx_click),       // confirm / launch a game: a short click, not the old chime
+        SUBMENU("submenu", R.raw.sfx_submenu),   // open a settings menu / sub-screen
+        MENU_OPEN("menu", R.raw.sfx_menu),       // open the in-game pause menu
+        BACK("back", R.raw.sfx_back),
+        TOGGLE_ON("toggle_on", R.raw.sfx_toggle_on),
+        TOGGLE_OFF("toggle_off", R.raw.sfx_toggle_off),
+        RESET("reset", R.raw.sfx_reset),
+        SLIDER("slider", R.raw.sfx_nav_a, R.raw.sfx_nav_b), // shares the alternating nav ticks
+        SLEEP("sleep", R.raw.sfx_sleep),         // DS-lid-style chime when the device sleeps
+        WAKE("wake", R.raw.sfx_wake),            // chime when waking back to the app
+        POPUP_OPEN("popup_open", R.raw.sfx_popup_open),   // a dialog/popup appears (hardcore confirm, info)
+        POPUP_CLOSE("popup_close", R.raw.sfx_popup_close), // ...and dismisses
+    }
+
+    /** On by default — the bundled sounds give the launcher its "personality" out of the box. */
+    val enabled = mutableStateOf(true)
+    val volumePercent = mutableStateOf(DefaultVolumePercent)
+    /** Name of an imported custom pack folder, or null when using the bundled defaults. */
+    val packName = mutableStateOf<String?>(null)
+
+    private fun gain(): Float = (volumePercent.value.coerceIn(0, 100)) / 100f
+
+    private var pool: SoundPool? = null
+    /** event -> loaded SoundPool sample id. */
+    private val sampleIds = HashMap<Event, Int>()
+    /** Second sample for events with an [Event.altRes] (NAV/SLIDER): [play] alternates between
+     *  this and the primary so a fast walk/drag varies the tick instead of machine-gunning one. */
+    private val altSampleIds = HashMap<Event, Int>()
+    private var navAlt = false
+    /** Per-event last-play time, to throttle rapid emitters (a slider drag fires onChange many
+     *  times/second — without this it buzzes instead of ticking). */
+    private val lastPlayMs = HashMap<Event, Long>()
+    /** Uptime of the last sound that ACTUALLY played (post-throttle). Lets a generic dispatch like
+     *  SettingsControllerNav.confirm() tell whether the action it invoked already made its own
+     *  sound, so it only adds a select blip when the action was silent. */
+    @Volatile private var lastPlayedMs = 0L
+    fun lastPlayedAt(): Long = lastPlayedMs
+
+    /** App-private dir any imported clips live in — copied here so playback needs no persisted SAF
+     *  grant and survives the source moving. Stored extension-less; SoundPool sniffs the format. */
+    private fun sfxDir(context: Context): File =
+        File(context.filesDir, "menusfx").apply { mkdirs() }
+
+    private fun clipFile(context: Context, event: Event): File = File(sfxDir(context), event.fileName)
+
+    fun load(context: Context) {
+        enabled.value = MainActivityRuntime.prefs.getBoolean(EnabledKey, true)
+        volumePercent.value = MainActivityRuntime.prefs.getInt(VolumeKey, DefaultVolumePercent)
+        packName.value = MainActivityRuntime.prefs.getString(PackNameKey, null)
+        // Also when the launcher's own blips are off but the emulator still has a sound to
+        // play through this pool. set() already had this; load() did not, so a user with menu
+        // sounds disabled got no pool at startup and a silent trophy.
+        if (enabled.value || TrophySound.isSet()) rebuildPool(context)
+    }
+
+    fun set(context: Context, value: Boolean) {
+        enabled.value = value
+        MainActivityRuntime.prefs.edit { putBoolean(EnabledKey, value) }
+        // Turning the launcher blips off does not tear the pool down while the emulator still
+        // has a sound to play through it. See [playFile].
+        if (value) rebuildPool(context)
+        else if (!TrophySound.isSet()) releasePool()
+    }
+
+    /** Bring the pool up if it is down. For sounds that are not the launcher's own and so are
+     *  not covered by [enabled] -- currently the trophy, which has its own setting. */
+    fun ensurePool(context: Context) {
+        if (pool == null) rebuildPool(context)
+    }
+
+    fun setVolume(percent: Int) {
+        val p = percent.coerceIn(0, 100)
+        volumePercent.value = p
+        MainActivityRuntime.prefs.edit { putInt(VolumeKey, p) }
+    }
+
+    /** Which events are currently served by an imported custom clip (vs the bundled default) —
+     *  drives the per-event status shown in settings. */
+    fun customEvents(context: Context): Set<Event> =
+        Event.entries.filter { clipFile(context, it).length() > 0L }.toSet()
+
+    /**
+     * Import a user-picked folder: copy every file whose base name matches an [Event] into
+     * app-private storage (overriding that event's bundled default), then rebuild the SoundPool.
+     * Returns how many clips were imported.
+     */
+    fun importFromTree(context: Context, treeUri: Uri): Int {
+        val tree = DocumentFile.fromTreeUri(context, treeUri) ?: return 0
+        var copied = 0
+        val dir = sfxDir(context)
+        tree.listFiles().forEach { doc ->
+            val event = doc.name?.let(::eventForFilename) ?: return@forEach
+            val ok = runCatching {
+                context.contentResolver.openInputStream(doc.uri)?.use { ins ->
+                    File(dir, event.fileName).outputStream().use { ins.copyTo(it) }
+                } != null
+            }.getOrDefault(false)
+            if (ok) copied++
+        }
+        if (copied > 0) {
+            val name = tree.name ?: "Sound pack"
+            packName.value = name
+            MainActivityRuntime.prefs.edit { putString(PackNameKey, name) }
+            rebuildPool(context)
+        }
+        return copied
+    }
+
+    /** Drop the imported pack and go back to the bundled defaults. The trophy sound is NOT
+     *  touched: it has its own setting, and clearing a menu pack should not silently remove
+     *  a sound the user chose somewhere else. */
+    fun clear(context: Context) {
+        Event.entries.forEach { runCatching { clipFile(context, it).delete() } }
+        packName.value = null
+        MainActivityRuntime.prefs.edit { remove(PackNameKey) }
+        if (enabled.value) rebuildPool(context) else releasePool()
+    }
+
+    /** Fire an event's sound, if enabled. Cheap no-op otherwise — safe to call from any UI
+     *  callback. Throttled per event so a fast slider drag ticks rather than buzzes. */
+    /**
+     * Play a sound the emulator core asked for, by absolute path.
+     *
+     * The core has always requested these: a trophy popping, a dialog opening, the on-screen
+     * keyboard. Every one went to `.play_sound = [](auto...) {}`, an empty lambda, so none of
+     * them has ever made a noise on Android. See overlays.cpp, which resolves them all to
+     * <config>/sounds/<name>.wav.
+     *
+     * Deliberately routed through THIS pool rather than a player of its own: the attributes
+     * above keep UI audio off the emulator's Oboe path, and a trophy that contended with SPU2
+     * output would be a worse bug than a trophy that made no sound.
+     *
+     * Samples are cached by path. A trophy run in a game that pops several in a row would
+     * otherwise decode the same file each time, and SoundPool ids leak if you never reuse them.
+     *
+     * Silent when the file is absent, which matches desktop: RPCS3 ships no sounds either, it
+     * plays whatever the user has placed in that folder.
+     */
+    private val pathSampleIds = HashMap<String, Int>()
+
+    /** Sample ids SoundPool has finished decoding. See the note in [playFile]. */
+    private val loadedSamples = java.util.Collections.synchronizedSet(HashSet<Int>())
+
+    /** Gain to use for a sample that was asked for before it finished decoding. */
+    private val pendingPlays = java.util.Collections.synchronizedMap(HashMap<Int, Float>())
+
+    /**
+     * Decode a core sound now rather than on the frame it is first needed.
+     *
+     * Called when the pool comes up and when a sound is imported, so the trophy is ready long
+     * before a game unlocks one.
+     */
+    fun preload(path: String) {
+        val sp = pool ?: return
+        val asked = runCatching { File(path) }.getOrNull() ?: return
+        val file = asked.takeIf { it.isFile && it.length() > 0L }
+            ?: listOf("ogg", "mp3").firstNotNullOfOrNull { ext ->
+                File(asked.parentFile, asked.nameWithoutExtension + "." + ext)
+                    .takeIf { it.isFile && it.length() > 0L }
+            }
+            ?: return
+        val key = file.absolutePath
+        if (pathSampleIds.containsKey(key)) return
+        runCatching { sp.load(key, 1) }.getOrDefault(0)
+            .also { if (it != 0) pathSampleIds[key] = it }
+    }
+
+    /** Drop a cached sample so a replaced file is re-read instead of the old one replaying. */
+    fun forgetCachedFile(path: String) {
+        pathSampleIds.remove(path)
+    }
+
+    // @Keep is load-bearing, not tidiness. Release builds run R8, which renames
+    // com.armsx2.MenuSfx and this method, and the core reaches both by their ORIGINAL names
+    // through FindClass/GetStaticMethodID. Without it the bridge silently fails to install and
+    // every sound the emulator asks for is dropped before it ever reaches Kotlin -- trophies,
+    // dialogs, the on-screen keyboard. The androidx consumer rule
+    // `-keepclasseswithmembers class * { @Keep <methods>; }` keeps the CLASS name too, which is
+    // why annotating the method is enough and why storage/ContentUri has always worked.
+    //
+    // Calls from Kotlin are unaffected either way, since R8 renames both sides together. That
+    // is exactly why the settings Test button worked while an actual trophy was silent.
+    @Keep
+    @JvmStatic
+    fun playFile(path: String, volume: Float) {
+        // No [enabled] check. That toggle is the launcher's own interface blips; these come from
+        // the emulator. A user who turned the menu ticks off did not thereby ask for silent
+        // trophies, and the trophy has its own setting to turn off.
+        val sp = pool ?: run { Log.i(TAG, "playFile: NO POOL, path=$path"); return }
+        // The core always asks for .wav. An imported pack may have supplied ogg or mp3, which
+        // SoundPool plays just as happily, so fall back to a sibling with the same stem rather
+        // than making the user convert.
+        val asked = runCatching { File(path) }.getOrNull() ?: return
+        val file = asked.takeIf { it.isFile && it.length() > 0L }
+            ?: listOf("ogg", "mp3").firstNotNullOfOrNull { ext ->
+                File(asked.parentFile, asked.nameWithoutExtension + "." + ext)
+                    .takeIf { it.isFile && it.length() > 0L }
+            }
+            ?: run { Log.i(TAG, "playFile: NO FILE at $path (nor .ogg/.mp3)"); return }
+
+        val key = file.absolutePath
+        Log.i(TAG, "playFile: resolved -> $key")
+        val id = pathSampleIds[key] ?: runCatching { sp.load(key, 1) }
+            .getOrDefault(0)
+            .also { if (it != 0) pathSampleIds[key] = it }
+
+        if (id == 0) return
+
+        // SoundPool.load is ASYNCHRONOUS: it hands back an id immediately and decodes on its
+        // own thread, so playing on the next line does nothing the first time. A trophy fires
+        // exactly once, which is why this was silent in a game while the settings Test button
+        // worked, since pressing that twice finds the sample decoded.
+        //
+        // If it is not ready yet, record the gain and let the pool's listener play it when the
+        // decode lands. The listener is installed ONCE in rebuildPool and never replaced:
+        // SoundPool has a single listener slot and only notifies loads that finish AFTER it is
+        // set, so installing one here would both silence whatever was waiting on the previous
+        // one and, for a sample that had already finished, wait forever for a callback that
+        // can never come.
+        if (!loadedSamples.contains(id)) {
+            pendingPlays[id] = when {
+                volume >= 0f -> volume
+                TrophySound.owns(key) -> TrophySound.gain()
+                else -> gain()
+            }.coerceIn(0f, 1f)
+            Log.i(TAG, "playFile: sample $id not decoded yet, queued")
+            return
+        }
+
+        // The core passes a volume only where it means to override; otherwise it sends a
+        // negative and a user level applies -- the trophy's own where this is the trophy, and
+        // the UI level for the core sounds that have no control of their own (dialogs, the
+        // on-screen keyboard).
+        val gain = when {
+            volume >= 0f -> volume
+            TrophySound.owns(key) -> TrophySound.gain()
+            else -> gain()
+        }.coerceIn(0f, 1f)
+        sp.play(id, gain, gain, 1, 0, 1f)
+    }
+
+    fun play(event: Event) {
+        if (!enabled.value) return
+        val p = pool ?: return
+        val now = SystemClock.uptimeMillis()
+        // NAV and SLIDER fire on every highlight move / value step — a longer floor keeps a fast
+        // D-pad walk or drag ticking pleasantly instead of buzzing.
+        val minGap = if (event == Event.SLIDER || event == Event.NAV) 45L else 18L
+        if (now - (lastPlayMs[event] ?: 0L) < minGap) return
+        // Alternate the two loaded ticks for events that have a second sample (NAV/SLIDER); flip
+        // only when we actually play (post-throttle) so the alternation follows audible ticks.
+        val id = if (altSampleIds.containsKey(event)) {
+            navAlt = !navAlt
+            (if (navAlt) altSampleIds[event] else sampleIds[event]) ?: return
+        } else (sampleIds[event] ?: return)
+        lastPlayMs[event] = now
+        lastPlayedMs = now
+        val g = gain()
+        runCatching { p.play(id, g, g, 1, 0, 1f) }
+    }
+
+    /** Map an incoming filename to an event by its base name (case/extension-insensitive). */
+    private fun eventForFilename(name: String): Event? {
+        val base = name.substringBeforeLast('.').lowercase().trim()
+        return Event.entries.firstOrNull { it.fileName == base }
+    }
+
+    private fun rebuildPool(context: Context) {
+        releasePool()
+        val sp = SoundPool.Builder()
+            .setMaxStreams(6)
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_GAME)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                    .build()
+            )
+            .build()
+
+        // One listener for the life of the pool. It records what has finished decoding and
+        // plays anything that was asked for while the decode was still in flight.
+        sp.setOnLoadCompleteListener { p, sampleId, status ->
+            if (status != 0) return@setOnLoadCompleteListener
+            loadedSamples.add(sampleId)
+            pendingPlays.remove(sampleId)?.let { g ->
+                runCatching { p.play(sampleId, g, g, 1, 0, 1f) }
+            }
+        }
+
+        Event.entries.forEach { ev ->
+            runCatching {
+                val custom = clipFile(context, ev)
+                val id = if (custom.length() > 0L) sp.load(custom.absolutePath, 1)
+                         else sp.load(context, ev.defaultRes, 1)
+                if (id != 0) sampleIds[ev] = id
+                // Second (alternating) sample: bundled-only. A custom "nav" import overrides the
+                // primary tick and alternates against this bundled hover tick.
+                if (ev.altRes != 0) sp.load(context, ev.altRes, 1).let { if (it != 0) altSampleIds[ev] = it }
+            }.onFailure { Log.w(TAG, "load failed for ${ev.fileName}", it) }
+        }
+        pool = sp
+
+        // Get the emulator's own sounds decoded now. A trophy plays once, at a moment we do
+        // not control, so discovering the sample is not ready yet at that point means silence.
+        TrophySound.corePath()?.let { preload(it) }
+    }
+
+    private fun releasePool() {
+        sampleIds.clear()
+        pathSampleIds.clear()
+        loadedSamples.clear()
+        pendingPlays.clear()
+        altSampleIds.clear()
+        lastPlayMs.clear()
+        pool?.let { runCatching { it.release() } }
+        pool = null
+    }
+}
